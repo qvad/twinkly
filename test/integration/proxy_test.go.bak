@@ -1,0 +1,355 @@
+package integration
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	_ "github.com/lib/pq"
+	"github.com/qvad/twinkly/pkg/config"
+)
+
+// TestEnvironment holds database connections for integration tests
+type TestEnvironment struct {
+	PostgresDB *sql.DB
+	YugabyteDB *sql.DB
+	Config     *config.Config
+}
+
+// setupTestEnvironment creates database connections
+func setupTestEnvironment(t *testing.T) *TestEnvironment {
+	// Create minimal test config
+	cfg := &config.Config{
+		Proxy: config.ProxyConfig{
+			ListenPort: 5431,
+			PostgreSQL: config.DatabaseConfig{
+				Host:     getEnv("POSTGRES_HOST", "postgres"),
+				Port:     5432,
+				User:     getEnv("POSTGRES_USER", "testuser"),
+				Database: getEnv("POSTGRES_DB", "testdb"),
+			},
+			YugabyteDB: config.DatabaseConfig{
+				Host:     getEnv("YUGABYTE_HOST", "yugabytedb"),
+				Port:     5433,
+				User:     getEnv("YUGABYTE_USER", "yugabyte"),
+				Database: getEnv("YUGABYTE_DB", "yugabyte"),
+			},
+		},
+	}
+
+	// Direct PostgreSQL connection
+	postgresPassword := getEnv("POSTGRES_PASSWORD", "testpass")
+	pgConnStr := fmt.Sprintf("host=%s port=%d user=%s dbname=%s password=%s sslmode=disable",
+		cfg.Proxy.PostgreSQL.Host, cfg.Proxy.PostgreSQL.Port, cfg.Proxy.PostgreSQL.User, 
+		cfg.Proxy.PostgreSQL.Database, postgresPassword)
+	pgDB, err := sql.Open("postgres", pgConnStr)
+	if err != nil {
+		t.Fatalf("Failed to connect to PostgreSQL: %v", err)
+	}
+
+	// Direct YugabyteDB connection
+	ybConnStr := fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable",
+		cfg.Proxy.YugabyteDB.Host, cfg.Proxy.YugabyteDB.Port, cfg.Proxy.YugabyteDB.User, 
+		cfg.Proxy.YugabyteDB.Database)
+	ybDB, err := sql.Open("postgres", ybConnStr)
+	if err != nil {
+		t.Fatalf("Failed to connect to YugabyteDB: %v", err)
+	}
+
+	// Wait for databases to be ready
+	if err := waitForDatabase(pgDB, "PostgreSQL"); err != nil {
+		t.Fatalf("PostgreSQL not ready: %v", err)
+	}
+	if err := waitForDatabase(ybDB, "YugabyteDB"); err != nil {
+		t.Fatalf("YugabyteDB not ready: %v", err)
+	}
+
+	// Verify test data exists
+	if err := setupTestData(pgDB, ybDB); err != nil {
+		t.Fatalf("Failed to verify test data: %v", err)
+	}
+
+	return &TestEnvironment{
+		PostgresDB: pgDB,
+		YugabyteDB: ybDB,
+		Config:     cfg,
+	}
+}
+
+// waitForDatabase waits for a database to become available
+func waitForDatabase(db *sql.DB, name string) error {
+	for i := 0; i < 30; i++ {
+		if err := db.Ping(); err == nil {
+			return nil
+		}
+		fmt.Printf("Waiting for %s to be ready...\n", name)
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("%s did not become ready in time", name)
+}
+
+// setupTestData initializes test data in both databases
+func setupTestData(pgDB, ybDB *sql.DB) error {
+	// Verify tables exist and have data
+	query := "SELECT COUNT(*) FROM users"
+	
+	var pgCount, ybCount int
+	if err := pgDB.QueryRow(query).Scan(&pgCount); err != nil {
+		return fmt.Errorf("failed to query PostgreSQL: %v", err)
+	}
+	if err := ybDB.QueryRow(query).Scan(&ybCount); err != nil {
+		return fmt.Errorf("failed to query YugabyteDB: %v", err)
+	}
+
+	if pgCount != ybCount {
+		return fmt.Errorf("data mismatch: PostgreSQL has %d users, YugabyteDB has %d users", pgCount, ybCount)
+	}
+
+	return nil
+}
+
+// getEnv gets an environment variable with a default value
+// This function is also defined in database_test.go - using that one instead
+
+// teardownTestEnvironment closes all connections
+func (env *TestEnvironment) teardown() {
+	if env.PostgresDB != nil {
+		env.PostgresDB.Close()
+	}
+	if env.YugabyteDB != nil {
+		env.YugabyteDB.Close()
+	}
+}
+
+// TestBasicQueries tests basic SELECT operations on both databases
+func TestBasicQueries(t *testing.T) {
+	env := setupTestEnvironment(t)
+	defer env.teardown()
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{
+			name:  "Simple SELECT",
+			query: "SELECT COUNT(*) FROM users",
+		},
+		{
+			name:  "SELECT with WHERE clause",
+			query: "SELECT username FROM users WHERE id = 1",
+		},
+		{
+			name:  "JOIN query",
+			query: `SELECT u.username, COUNT(o.id) as order_count 
+					FROM users u 
+					LEFT JOIN orders o ON u.id = o.user_id 
+					GROUP BY u.id, u.username`,
+		},
+		{
+			name:  "Complex aggregate query",
+			query: `SELECT 
+						p.category,
+						COUNT(*) as product_count,
+						AVG(p.price) as avg_price
+					FROM products p
+					GROUP BY p.category
+					ORDER BY avg_price DESC`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Test direct PostgreSQL query
+			var pgResult interface{}
+			err := env.PostgresDB.QueryRow("SELECT COUNT(*) FROM (" + tt.query + ") AS subq").Scan(&pgResult)
+			if err != nil {
+				t.Fatalf("PostgreSQL query failed: %v", err)
+			}
+
+			// Test direct YugabyteDB query
+			var ybResult interface{}
+			err = env.YugabyteDB.QueryRow("SELECT COUNT(*) FROM (" + tt.query + ") AS subq").Scan(&ybResult)
+			if err != nil {
+				t.Fatalf("YugabyteDB query failed: %v", err)
+			}
+
+			// Results should match (basic consistency check)
+			if pgResult != ybResult {
+				t.Errorf("Result mismatch: PostgreSQL=%v, YugabyteDB=%v", pgResult, ybResult)
+			} else {
+				t.Logf("Query '%s' returned %v rows from both databases", tt.name, pgResult)
+			}
+		})
+	}
+}
+
+// TestDataConsistency verifies that both databases have identical data
+func TestDataConsistency(t *testing.T) {
+	env := setupTestEnvironment(t)
+	defer env.teardown()
+
+	tables := []string{"users", "products", "orders"}
+
+	for _, table := range tables {
+		t.Run(fmt.Sprintf("Table_%s", table), func(t *testing.T) {
+			query := fmt.Sprintf("SELECT COUNT(*) FROM %s", table)
+
+			var pgCount, ybCount int
+			err := env.PostgresDB.QueryRow(query).Scan(&pgCount)
+			if err != nil {
+				t.Fatalf("Failed to query PostgreSQL %s: %v", table, err)
+			}
+
+			err = env.YugabyteDB.QueryRow(query).Scan(&ybCount)
+			if err != nil {
+				t.Fatalf("Failed to query YugabyteDB %s: %v", table, err)
+			}
+
+			if pgCount != ybCount {
+				t.Errorf("Row count mismatch in %s: PostgreSQL=%d, YugabyteDB=%d", 
+					table, pgCount, ybCount)
+			}
+		})
+	}
+}
+
+// TestTransactionHandling tests transaction behavior
+func TestTransactionHandling(t *testing.T) {
+	env := setupTestEnvironment(t)
+	defer env.teardown()
+
+	// Test transaction rollback consistency
+	t.Run("TransactionRollback", func(t *testing.T) {
+		// Begin transactions on both databases
+		pgTx, err := env.PostgresDB.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin PostgreSQL transaction: %v", err)
+		}
+		defer pgTx.Rollback()
+
+		ybTx, err := env.YugabyteDB.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin YugabyteDB transaction: %v", err)
+		}
+		defer ybTx.Rollback()
+
+		// Insert test data
+		insertSQL := "INSERT INTO users (username, email) VALUES ('test_user', 'test@example.com')"
+		
+		_, err = pgTx.Exec(insertSQL)
+		if err != nil {
+			t.Fatalf("PostgreSQL insert failed: %v", err)
+		}
+
+		_, err = ybTx.Exec(insertSQL)
+		if err != nil {
+			t.Fatalf("YugabyteDB insert failed: %v", err)
+		}
+
+		// Rollback both transactions
+		pgTx.Rollback()
+		ybTx.Rollback()
+
+		// Verify data was rolled back
+		var pgCount, ybCount int
+		env.PostgresDB.QueryRow("SELECT COUNT(*) FROM users WHERE username = 'test_user'").Scan(&pgCount)
+		env.YugabyteDB.QueryRow("SELECT COUNT(*) FROM users WHERE username = 'test_user'").Scan(&ybCount)
+
+		if pgCount != 0 || ybCount != 0 {
+			t.Errorf("Transaction rollback failed: PostgreSQL count=%d, YugabyteDB count=%d", 
+				pgCount, ybCount)
+		}
+	})
+}
+
+// TestErrorHandling tests error scenarios
+func TestErrorHandling(t *testing.T) {
+	env := setupTestEnvironment(t)
+	defer env.teardown()
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{
+			name:  "Syntax Error",
+			query: "SELEC * FROM users", // Intentional typo
+		},
+		{
+			name:  "Table Not Found",
+			query: "SELECT * FROM nonexistent_table",
+		},
+		{
+			name:  "Constraint Violation",
+			query: "INSERT INTO users (username, email) VALUES ('alice', 'duplicate@example.com')", // alice already exists
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Test that both databases return errors (consistency in error behavior)
+			_, pgErr := env.PostgresDB.Exec(tt.query)
+			_, ybErr := env.YugabyteDB.Exec(tt.query)
+
+			// Both should error (though error messages may differ)
+			if pgErr == nil {
+				t.Errorf("Expected PostgreSQL to return error for: %s", tt.query)
+			}
+			if ybErr == nil {
+				t.Errorf("Expected YugabyteDB to return error for: %s", tt.query)
+			}
+		})
+	}
+}
+
+// TestPerformanceComparison basic performance comparison
+func TestPerformanceComparison(t *testing.T) {
+	env := setupTestEnvironment(t)
+	defer env.teardown()
+
+	query := "SELECT u.*, p.* FROM users u JOIN orders o ON u.id = o.user_id JOIN products p ON o.product_id = p.id"
+
+	// Measure PostgreSQL performance
+	pgStart := time.Now()
+	rows, err := env.PostgresDB.Query(query)
+	if err != nil {
+		t.Fatalf("PostgreSQL query failed: %v", err)
+	}
+	pgRows := 0
+	for rows.Next() {
+		pgRows++
+	}
+	rows.Close()
+	pgDuration := time.Since(pgStart)
+
+	// Measure YugabyteDB performance
+	ybStart := time.Now()
+	rows, err = env.YugabyteDB.Query(query)
+	if err != nil {
+		t.Fatalf("YugabyteDB query failed: %v", err)
+	}
+	ybRows := 0
+	for rows.Next() {
+		ybRows++
+	}
+	rows.Close()
+	ybDuration := time.Since(ybStart)
+
+	// Log performance comparison
+	t.Logf("Performance comparison for complex join:")
+	t.Logf("PostgreSQL: %d rows in %v", pgRows, pgDuration)
+	t.Logf("YugabyteDB: %d rows in %v", ybRows, ybDuration)
+
+	// Verify same number of rows
+	if pgRows != ybRows {
+		t.Errorf("Row count mismatch: PostgreSQL=%d, YugabyteDB=%d", pgRows, ybRows)
+	}
+
+	// Performance ratio analysis (for information, not failure)
+	if ybDuration > 0 {
+		ratio := float64(pgDuration) / float64(ybDuration)
+		t.Logf("Performance ratio (PG/YB): %.2f", ratio)
+	}
+}

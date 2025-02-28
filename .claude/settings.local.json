@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(rm:*)",
+      "Bash(docker-compose -f docker-compose.test.yml ps)",
+      "Bash(docker-compose:*)",
+      "Bash(docker system prune:*)",
+      "Bash(docker logs:*)",
+      "Bash(POSTGRES_HOST=localhost go test -v ./test/integration/ -run TestPostgreSQLOnly)",
+      "Bash(mv:*)",
+      "Bash(psql:*)",
+      "Bash(PGPASSWORD=testpass psql:*)",
+      "Bash(docker exec:*)",
+      "Bash(docker run:*)",
+      "Bash(docker build:*)",
+      "Bash(make:*)",
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(go version:*)",
+      "Bash(go env:*)",
+      "Bash(docker --version:*)",
+      "Bash(wc:*)",
+      "Bash(for func in \"InitializePools\" \"CompareQuery\" \"MirrorDDLToSecondary\" \"MirrorDMLToSecondary\" \"GetPGConn\" \"ValidateQuery\" \"MapError\" \"AddOrderByToQuery\")",
+      "Bash(do echo \"=== $func ===\")",
+      "Bash(done)",
+      "Bash(ls:*)",
+      "Bash(xargs:*)",
+      "Bash(POSTGRES_HOST=localhost YUGABYTE_HOST=localhost go test:*)",
+      "Bash(pkill:*)",
+      "Bash(./twinkly:*)",
+      "Bash(cat:*)"
+    ],
+    "deny": []
+  }
+}
