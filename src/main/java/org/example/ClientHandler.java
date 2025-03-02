@@ -223,7 +223,8 @@ class ClientHandler implements Runnable {
         String statementName = new String(nameStream.toByteArray(), StandardCharsets.UTF_8);
 
         // Read portal name (usually empty, terminated by 0)
-        while (input.read() != 0) {}
+        while (input.read() != 0) {
+        }
 
         // Read max rows to return (ignore for now)
         byte[] maxRowsBytes = new byte[4];
@@ -259,7 +260,7 @@ class ClientHandler implements Runnable {
                 if (pgUpdate != ybUpdate) {
                     System.err.println("Update results differ for query: " + query);
                 }
-                sendUpdateToClient(output, String.valueOf(pgUpdate));
+                sendUpdateToClient(output, query, pgUpdate);
             }
         } catch (SQLException e) {
             System.err.println("Database error: " + e.getMessage());
@@ -359,6 +360,9 @@ class ClientHandler implements Runnable {
 
         System.out.println("Received query: " + query);
 
+        // Extract the command name (first keyword of the SQL query)
+        String command = query.split("\\s+")[0].toUpperCase();
+
         // Execute query on both databases
         try (Connection pgConn = DriverManager.getConnection("jdbc:postgresql://localhost:5432/postgres", "postgres", "postgres");
              Connection ybConn = DriverManager.getConnection("jdbc:postgresql://localhost:5433/yugabyte", "postgres", "postgres");
@@ -372,7 +376,7 @@ class ClientHandler implements Runnable {
                 ResultSet pgResult = pgStmt.getResultSet();
                 ResultSet ybResult = ybStmt.getResultSet();
 
-                if (!compareResults(pgResult, ybResult)) {
+                if (!query.contains("pg_") && !compareResults(pgResult, ybResult)) {
                     System.err.println("Results differ for query: " + query);
                 }
 
@@ -381,17 +385,18 @@ class ClientHandler implements Runnable {
                 int pgUpdate = pgStmt.getUpdateCount();
                 int ybUpdate = ybStmt.getUpdateCount();
 
-                if (pgUpdate != ybUpdate) {
+                if (!query.contains("pg_") && pgUpdate != ybUpdate) {
                     System.err.println("Update results differ for query: " + query);
                 }
 
-                sendUpdateToClient(output, String.valueOf(pgUpdate));
+                sendUpdateToClient(output, command, pgUpdate);
             }
         } catch (SQLException e) {
             System.err.println("Database error: " + e.getMessage());
             sendErrorToClient(output, e.getMessage());
         }
     }
+
 
     private boolean compareResults(ResultSet rs1, ResultSet rs2) throws SQLException {
         while (rs1.next() && rs2.next()) {
@@ -410,90 +415,157 @@ class ClientHandler implements Runnable {
         ResultSetMetaData metaData = rs.getMetaData();
         int columnCount = metaData.getColumnCount();
 
-        // Send RowDescription (column metadata)
+        System.out.println("📢 Sending SELECT results: " + columnCount + " columns");
+
+        // Build RowDescription (T) message
         ByteArrayOutputStream rowDescStream = new ByteArrayOutputStream();
         rowDescStream.write('T'); // RowDescription message type
-        rowDescStream.write(intToBytes(6 + (columnCount * 18))); // Message length
-        rowDescStream.write(shortToBytes(columnCount)); // Number of columns
+
+        ByteArrayOutputStream columnData = new ByteArrayOutputStream();
+        columnData.write(shortToBytes(columnCount)); // Number of columns
 
         for (int i = 1; i <= columnCount; i++) {
-            rowDescStream.write(metaData.getColumnName(i).getBytes(StandardCharsets.UTF_8)); // Column name
-            rowDescStream.write(0); // Null-terminated
-            rowDescStream.write(intToBytes(0)); // Table OID (unused)
-            rowDescStream.write(shortToBytes(0)); // Column attribute number
-            rowDescStream.write(intToBytes(23)); // Data type OID (int4 for now)
-            rowDescStream.write(shortToBytes(4)); // Data type size
-            rowDescStream.write(intToBytes(-1)); // Type modifier
-            rowDescStream.write(shortToBytes(0)); // Format code
-        }
-        output.write(rowDescStream.toByteArray());
+            String columnName = metaData.getColumnName(i);
+            columnData.write(columnName.getBytes(StandardCharsets.UTF_8)); // Column name
+            columnData.write(0); // Null-terminated
 
-        // Send DataRow messages (actual result set)
+            columnData.write(intToBytes(0)); // Table OID (set to 0)
+            columnData.write(shortToBytes(0)); // Column attribute number
+
+            columnData.write(intToBytes(23)); // Data type OID (23 = int4 for now)
+            columnData.write(shortToBytes(4)); // Data type size (int4 = 4 bytes)
+            columnData.write(intToBytes(-1)); // Type modifier (-1 means none)
+            columnData.write(shortToBytes(0)); // Format code (0 = text)
+        }
+
+        // Calculate total message length
+        byte[] columnMetadataBytes = columnData.toByteArray();
+        int messageLength = 4 + columnMetadataBytes.length;
+
+        rowDescStream.write(intToBytes(messageLength)); // Message length
+        rowDescStream.write(columnMetadataBytes); // Column metadata content
+
+        output.write(rowDescStream.toByteArray());
+        output.flush();
+
+        int rowCount = 0;
+
+        // Send DataRow (D) messages
         while (rs.next()) {
+            rowCount++;
+
             ByteArrayOutputStream dataRowStream = new ByteArrayOutputStream();
             dataRowStream.write('D'); // DataRow message type
-            dataRowStream.write(intToBytes(6 + (columnCount * 8))); // Message length
-            dataRowStream.write(shortToBytes(columnCount)); // Number of columns
+
+            ByteArrayOutputStream rowData = new ByteArrayOutputStream();
+            rowData.write(shortToBytes(columnCount)); // Number of columns
 
             for (int i = 1; i <= columnCount; i++) {
                 String value = rs.getString(i);
+                System.out.println("📢 Row " + rowCount + ", Column " + i + ": " + value);
+
                 if (value == null) {
-                    dataRowStream.write(intToBytes(-1)); // NULL value
+                    rowData.write(intToBytes(-1)); // NULL value
                 } else {
                     byte[] valueBytes = value.getBytes(StandardCharsets.UTF_8);
-                    dataRowStream.write(intToBytes(valueBytes.length));
-                    dataRowStream.write(valueBytes);
+                    rowData.write(intToBytes(valueBytes.length));
+                    rowData.write(valueBytes);
                 }
             }
+
+            byte[] rowBytes = rowData.toByteArray();
+            int rowLength = 4 + rowBytes.length; // Length includes itself
+
+            dataRowStream.write(intToBytes(rowLength)); // Message length
+            dataRowStream.write(rowBytes); // Actual row data
+
             output.write(dataRowStream.toByteArray());
         }
 
-        // Send CommandComplete
-        output.write(new byte[]{'C', 0, 0, 0, 8, 'S', 'E', 'L', 'E', 'C', 'T', 0});
+        System.out.println("✅ Sent " + rowCount + " rows to client");
 
-        // Send ReadyForQuery (Idle)
-        output.write(new byte[]{'Z', 0, 0, 0, 5, 'I'});
-        output.flush();
+        // Send CommandComplete (C)
+        sendUpdateToClient(output, "SELECT", rowCount);
     }
 
 
-    private void sendUpdateToClient(OutputStream output, String commandTag) throws IOException {
+    private void sendUpdateToClient(OutputStream output, String command, int updateCount) throws IOException {
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
 
         buffer.write('C'); // CommandComplete message type
 
+        // Construct the correct command tag based on command type
+        String commandTag;
+        if (command.equalsIgnoreCase("INSERT")) {
+            commandTag = "INSERT 0 " + updateCount; // PostgreSQL expects "INSERT OID COUNT"
+        } else {
+            commandTag = command.toUpperCase() + " " + updateCount; // UPDATE, DELETE, etc.
+        }
+
         byte[] commandBytes = commandTag.getBytes(StandardCharsets.UTF_8);
-        buffer.write(intToBytes(commandBytes.length + 4 + 1)); // Correct message length
+
+        // Calculate correct message length
+        int messageLength = 4 + commandBytes.length + 1; // 4-byte length + command + null terminator
+
+        buffer.write(intToBytes(messageLength)); // Correct message length
         buffer.write(commandBytes);
-        buffer.write(0); // Null-terminated
+        buffer.write(0); // Null terminator
 
         output.write(buffer.toByteArray());
         output.flush();
+
+        // 🚀 Send ReadyForQuery (Z) to properly end the transaction 🚀
+        output.write(new byte[]{'Z', 0, 0, 0, 5, 'I'}); // ReadyForQuery: idle transaction state
+        output.flush();
     }
+
 
     private void sendErrorToClient(OutputStream output, String errorMessage) throws IOException {
         ByteArrayOutputStream errorStream = new ByteArrayOutputStream();
 
         errorStream.write('E'); // ErrorResponse message type
 
-        // Calculate message length
-        byte[] errorBytes = errorMessage.getBytes(StandardCharsets.UTF_8);
-        int messageLength = 6 + errorBytes.length + 6; // 6 bytes for headers and null terminator
+        ByteArrayOutputStream errorContent = new ByteArrayOutputStream();
 
+        // Severity field (S = ERROR)
+        errorContent.write('S');
+        errorContent.write("ERROR".getBytes(StandardCharsets.UTF_8));
+        errorContent.write(0); // Null terminator
+
+        // Message field (M = Error message)
+        errorContent.write('M');
+        errorContent.write(errorMessage.getBytes(StandardCharsets.UTF_8));
+        errorContent.write(0); // Null terminator
+
+        // SQLSTATE (C = SQLSTATE error code, using a generic example '42601' - syntax error)
+        errorContent.write('C');
+        errorContent.write("42601".getBytes(StandardCharsets.UTF_8));
+        errorContent.write(0); // Null terminator
+
+        // Position field (P = Position of error in query, optional)
+        errorContent.write('P');
+        errorContent.write("26".getBytes(StandardCharsets.UTF_8));
+        errorContent.write(0); // Null terminator
+
+        // End of error message (final 0 byte)
+        errorContent.write(0);
+
+        // Calculate message length (4 bytes for length + content length)
+        byte[] errorBytes = errorContent.toByteArray();
+        int messageLength = 4 + errorBytes.length;
+
+        // Write message length
         errorStream.write(intToBytes(messageLength));
 
-        // Error fields: Severity (S), Message (M), and null-terminator
-        errorStream.write('S'); // Severity field
-        errorStream.write("ERROR".getBytes(StandardCharsets.UTF_8));
-        errorStream.write(0);
-
-        errorStream.write('M'); // Message field
+        // Write actual error message content
         errorStream.write(errorBytes);
-        errorStream.write(0);
 
-        errorStream.write(0); // End of error response
-
+        // Send error response to client
         output.write(errorStream.toByteArray());
+        output.flush();
+
+        // 🚀 Send ReadyForQuery (Z) to properly close the error response 🚀
+        output.write(new byte[]{'Z', 0, 0, 0, 5, 'I'}); // ReadyForQuery: idle transaction state
         output.flush();
     }
 
