@@ -16,12 +16,16 @@ class ClientHandler implements Runnable {
     private final Socket clientSocket;
     private Connection pgConnection;
     private Connection ybConnection;
+    private boolean inTransaction = false; // Track if a transaction is active
 
-
-    private Map<String, String> preparedStatements = new HashMap<>();
+    private final Map<String, String> preparedStatements = new HashMap<>();
 
     public ClientHandler(Socket clientSocket) {
         this.clientSocket = clientSocket;
+        establishConnections();
+    }
+
+    private void establishConnections() {
         try {
             // Explicitly load PostgreSQL driver
             Class.forName("org.postgresql.Driver");
@@ -29,28 +33,37 @@ class ClientHandler implements Runnable {
             Properties props = new Properties();
             props.setProperty("user", "postgres");
             props.setProperty("password", "postgres");
-            props.setProperty("ssl", "false");
 
-            pgConnection = DriverManager.getConnection("jdbc:postgresql://localhost:5433/postgres", props);
-            ybConnection = DriverManager.getConnection("jdbc:postgresql://localhost:5433/yugabyte", props);
+            // Keep connections open instead of creating new ones per query
+            this.pgConnection = DriverManager.getConnection("jdbc:postgresql://localhost:5432/postgres", props);
+            this.ybConnection = DriverManager.getConnection("jdbc:postgresql://localhost:5433/yugabyte", props);
+
+            System.out.println("✅ PostgreSQL and YugabyteDB connections established.");
         } catch (ClassNotFoundException e) {
             throw new RuntimeException("PostgreSQL JDBC Driver not found!", e);
         } catch (SQLException e) {
-            try {
-                if (pgConnection != null) {
-                    pgConnection.close();
-                }
-            } catch (SQLException ex) {
-                e.printStackTrace();
+            throw new RuntimeException("Failed to connect to databases", e);
+        }
+    }
+
+    private void reconnectIfNeeded() {
+        try {
+            if (pgConnection == null || pgConnection.isClosed()) {
+                System.err.println("🔄 Reconnecting to PostgreSQL...");
+                Properties props = new Properties();
+                props.setProperty("user", "postgres");
+                props.setProperty("password", "postgres");
+                this.pgConnection = DriverManager.getConnection("jdbc:postgresql://localhost:5433/postgres", props);
             }
-            try {
-                if (ybConnection != null) {
-                    ybConnection.close();
-                }
-            } catch (SQLException ex) {
-                e.printStackTrace();
+            if (ybConnection == null || ybConnection.isClosed()) {
+                System.err.println("🔄 Reconnecting to YugabyteDB...");
+                Properties props = new Properties();
+                props.setProperty("user", "postgres");
+                props.setProperty("password", "postgres");
+                this.ybConnection = DriverManager.getConnection("jdbc:postgresql://localhost:5433/yugabyte", props);
             }
-            e.printStackTrace();
+        } catch (SQLException e) {
+            System.err.println("❌ Failed to reconnect: " + e.getMessage());
         }
     }
 
@@ -64,17 +77,19 @@ class ClientHandler implements Runnable {
                 return; // Failed startup
             }
 
-            while (true) {
+            while (!clientSocket.isClosed()) {
                 int messageType = input.read();
                 if (messageType == -1) {
                     System.out.println("Client disconnected.");
-                    return;
+                    break;
                 }
 
                 // Ignore null bytes (\0) which are not valid message types
                 if (messageType == 0) {
                     continue;
                 }
+
+                System.out.println("Received message type: " + (char) messageType);
 
                 switch (messageType) {
                     case 'Q': // Simple Query
@@ -93,18 +108,40 @@ class ClientHandler implements Runnable {
                         handleDescribe(input, output);
                         break;
                     case 'S': // Sync
-                        handleSync(input, output);
+                        handleSync(output);
                         break;
                     case 'X': // Termination
-                        System.out.println("Client disconnected.");
+                        System.out.println("Client requested termination.");
                         return;
                     default:
                         System.err.println("Unknown message type: " + (char) messageType);
-                        skipUnknownMessage(input); // Ignore unknown message
+                        skipUnknownMessage(input); // Skip unknown message
                 }
             }
         } catch (IOException | SQLException e) {
-            e.printStackTrace();
+            System.err.println("I/O error: " + e.getMessage());
+        } finally {
+            closeConnections();
+        }
+    }
+
+    private void closeConnections() {
+        try {
+            if (pgConnection != null && !pgConnection.isClosed()) {
+                pgConnection.close();
+                System.out.println("PostgreSQL connection closed.");
+            }
+        } catch (SQLException e) {
+            System.err.println("Error closing PostgreSQL connection: " + e.getMessage());
+        }
+
+        try {
+            if (ybConnection != null && !ybConnection.isClosed()) {
+                ybConnection.close();
+                System.out.println("YugabyteDB connection closed.");
+            }
+        } catch (SQLException e) {
+            System.err.println("Error closing YugabyteDB connection: " + e.getMessage());
         }
     }
 
@@ -162,36 +199,34 @@ class ClientHandler implements Runnable {
     }
 
     private void handleParse(InputStream input, OutputStream output) throws IOException {
+        // Read message length
         byte[] lengthBytes = new byte[4];
         input.read(lengthBytes);
         int length = ByteBuffer.wrap(lengthBytes).getInt() - 4;
 
-        // Read statement name (null-terminated string)
-        ByteArrayOutputStream nameStream = new ByteArrayOutputStream();
-        while (true) {
-            int b = input.read();
-            if (b == 0) break;
-            nameStream.write(b);
-        }
-        String statementName = new String(nameStream.toByteArray(), StandardCharsets.UTF_8);
-
-        // Read query string (null-terminated)
-        ByteArrayOutputStream queryStream = new ByteArrayOutputStream();
-        while (true) {
-            int b = input.read();
-            if (b == 0) break;
-            queryStream.write(b);
-        }
-        String query = new String(queryStream.toByteArray(), StandardCharsets.UTF_8);
-
-        // Assign a default name if the statement name is empty
+        // Read the prepared statement name (null-terminated string)
+        String statementName = readNullTerminatedString(input);
         if (statementName.isEmpty()) {
-            statementName = "unnamed_" + System.nanoTime();
+            statementName = "unnamed";  // Ensure consistent naming
         }
 
-        System.out.println("Parsed prepared statement: " + statementName + " -> " + query);
+        // Read the actual SQL query (null-terminated string)
+        String query = readNullTerminatedString(input);
 
-        // Store query in prepared statement cache
+        // Read parameter count (not used for now)
+        byte[] paramCountBytes = new byte[2];
+        input.read(paramCountBytes);
+        int paramCount = ((paramCountBytes[0] & 0xFF) << 8) | (paramCountBytes[1] & 0xFF);
+
+        // Skip parameter types if any
+        if (paramCount > 0) {
+            byte[] paramTypes = new byte[paramCount * 4];
+            input.read(paramTypes);
+        }
+
+        System.out.println("📢 Parsed prepared statement: " + statementName + " -> " + query);
+
+        // Store the prepared statement
         preparedStatements.put(statementName, query);
 
         // Send ParseComplete response
@@ -200,7 +235,15 @@ class ClientHandler implements Runnable {
     }
 
     private void handleBind(InputStream input, OutputStream output) throws IOException {
-        skipUnknownMessage(input); // Ignore parameters for now
+        // Read message length
+        byte[] lengthBytes = new byte[4];
+        input.read(lengthBytes);
+        int length = ByteBuffer.wrap(lengthBytes).getInt() - 4;
+
+        // Just skip the rest of the bind message for now
+        if (length > 0) {
+            input.readNBytes(length);
+        }
 
         // Send BindComplete response
         output.write(new byte[]{'2', 0, 0, 0, 4});
@@ -208,71 +251,125 @@ class ClientHandler implements Runnable {
     }
 
     private void handleExecute(InputStream input, OutputStream output) throws IOException {
+        reconnectIfNeeded();
+
         // Read message length
         byte[] lengthBytes = new byte[4];
         input.read(lengthBytes);
         int length = ByteBuffer.wrap(lengthBytes).getInt() - 4;
 
-        // Read the prepared statement name (null-terminated string)
-        ByteArrayOutputStream nameStream = new ByteArrayOutputStream();
-        while (true) {
-            int b = input.read();
-            if (b == 0) break;
-            nameStream.write(b);
-        }
-        String statementName = new String(nameStream.toByteArray(), StandardCharsets.UTF_8);
+        // Read the portal name (null-terminated string)
+        String portalName = readNullTerminatedString(input);
 
-        // Read portal name (usually empty, terminated by 0)
-        while (input.read() != 0) {
-        }
-
-        // Read max rows to return (ignore for now)
+        // Read max rows to return
         byte[] maxRowsBytes = new byte[4];
         input.read(maxRowsBytes);
+        int maxRows = ByteBuffer.wrap(maxRowsBytes).getInt();
 
-        System.out.println("Executing prepared statement: " + statementName);
+        System.out.println("📢 Executing portal: " + portalName + ", MaxRows: " + maxRows);
 
-        // Retrieve the actual SQL query from the prepared statement cache
+        // For simplicity, use the 'unnamed' prepared statement by default
+        String statementName = "unnamed";
         String query = preparedStatements.get(statementName);
+
         if (query == null) {
-            System.err.println("Prepared statement not found: " + statementName);
-            sendErrorToClient(output, "Prepared statement not found");
+            System.err.println("❌ Prepared statement not found: " + statementName);
+            sendErrorToClient(output, "Prepared statement not found: " + statementName);
             return;
         }
 
-        // Execute the query
-        try (Statement pgStmt = pgConnection.createStatement();
-             Statement ybStmt = ybConnection.createStatement()) {
+        boolean isTransactionCommand = query.matches("(?i)^(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE).*");
 
-            boolean isQuery = pgStmt.execute(query);
-            boolean isQueryYB = ybStmt.execute(query);
-
-            if (isQuery && isQueryYB) {
-                ResultSet pgResult = pgStmt.getResultSet();
-                ResultSet ybResult = ybStmt.getResultSet();
-                if (!compareResults(pgResult, ybResult)) {
-                    System.err.println("Results differ for query: " + query);
-                }
-                sendResultsToClient(output, pgResult);
-            } else {
-                int pgUpdate = pgStmt.getUpdateCount();
-                int ybUpdate = ybStmt.getUpdateCount();
-                if (pgUpdate != ybUpdate) {
-                    System.err.println("Update results differ for query: " + query);
-                }
-                sendUpdateToClient(output, query, pgUpdate);
-            }
-        } catch (SQLException e) {
-            System.err.println("Database error: " + e.getMessage());
-            sendErrorToClient(output, e.getMessage());
+        if (query.matches("(?i)^BEGIN.*")) {
+            inTransaction = true;
+        } else if (query.matches("(?i)^(COMMIT|ROLLBACK).*")) {
+            inTransaction = false;
         }
 
-        // Send CommandComplete response
-        output.write(new byte[]{'C', 0, 0, 0, 8, 'E', 'X', 'E', 'C', 'U', 'T', 'E', 0});
+        boolean pgSuccess = true;
+        boolean ybSuccess = true;
+        SQLException pgException = null;
+        SQLException ybException = null;
 
-        // Send ReadyForQuery (Idle mode)
-        output.write(new byte[]{'Z', 0, 0, 0, 5, 'I'});
-        output.flush();
+        try {
+            reconnectIfNeeded();
+
+            // Execute on PostgreSQL
+            try (Statement pgStmt = pgConnection.createStatement()) {
+                if (isTransactionCommand) {
+                    pgStmt.execute(query);
+
+                    if (query.matches("(?i)^BEGIN.*")) {
+                        pgConnection.setAutoCommit(false);
+                    } else if (query.matches("(?i)^COMMIT.*")) {
+                        pgConnection.commit();
+                        pgConnection.setAutoCommit(true);
+                    } else if (query.matches("(?i)^ROLLBACK.*")) {
+                        pgConnection.rollback();
+                        pgConnection.setAutoCommit(true);
+                    }
+                } else {
+                    pgStmt.execute(query);
+                }
+            } catch (SQLException e) {
+                pgSuccess = false;
+                pgException = e;
+                System.err.println("❌ PostgreSQL Error: " + e.getMessage());
+            }
+
+            // Execute on YugabyteDB
+            try (Statement ybStmt = ybConnection.createStatement()) {
+                if (isTransactionCommand) {
+                    ybStmt.execute(query);
+
+                    if (query.matches("(?i)^BEGIN.*")) {
+                        ybConnection.setAutoCommit(false);
+                    } else if (query.matches("(?i)^COMMIT.*")) {
+                        ybConnection.commit();
+                        ybConnection.setAutoCommit(true);
+                    } else if (query.matches("(?i)^ROLLBACK.*")) {
+                        ybConnection.rollback();
+                        ybConnection.setAutoCommit(true);
+                    }
+                } else {
+                    ybStmt.execute(query);
+                }
+            } catch (SQLException e) {
+                ybSuccess = false;
+                ybException = e;
+                System.err.println("❌ YugabyteDB Error: " + e.getMessage());
+            }
+
+            // Handle inconsistent execution results
+            if (pgSuccess != ybSuccess) {
+                System.err.println("⚠️ Inconsistent execution between PostgreSQL and YugabyteDB!");
+                if (!pgSuccess) {
+                    sendErrorToClient(output, "ERROR in PostgreSQL: " + pgException.getMessage());
+                } else {
+                    sendErrorToClient(output, "ERROR in YugabyteDB: " + ybException.getMessage());
+                }
+                return;
+            }
+
+            // If both fail, send an error
+            if (!pgSuccess && !ybSuccess) {
+                sendErrorToClient(output, "ERROR: " + pgException.getMessage());
+                return;
+            }
+
+            // If both succeed, process results and send CommandComplete
+            System.out.println("🔄 Transaction state: " + (inTransaction ? "ACTIVE" : "INACTIVE"));
+
+            // Don't send CommandComplete here; it will be sent after Sync message
+
+            // Extract command from query for the CommandComplete message
+            String command = query.split("\\s+")[0].toUpperCase();
+            sendCommandComplete(output, command);
+
+        } catch (Exception e) {
+            System.err.println("❌ Database error: " + e.getMessage());
+            sendErrorToClient(output, e.getMessage());
+        }
     }
 
     private void skipUnknownMessage(InputStream input) throws IOException {
@@ -288,19 +385,27 @@ class ClientHandler implements Runnable {
     }
 
     private void handleDescribe(InputStream input, OutputStream output) throws IOException {
-        skipUnknownMessage(input); // Skip Describe message for now
+        // Read message length
+        byte[] lengthBytes = new byte[4];
+        input.read(lengthBytes);
+        int length = ByteBuffer.wrap(lengthBytes).getInt() - 4;
 
-        // Send NoData response (to indicate we’re not handling it fully yet)
+        // Read type (S = Statement, P = Portal)
+        byte describeType = (byte)input.read();
+
+        // Read name (null-terminated string)
+        String name = readNullTerminatedString(input);
+
+        System.out.println("Describe: " + (char)describeType + " " + name);
+
+        // Send NoData response for now
         output.write(new byte[]{'n', 0, 0, 0, 4});
         output.flush();
     }
 
-    private void handleSync(InputStream input, OutputStream output) throws IOException {
-        skipUnknownMessage(input); // Skip Sync message
-
-        // Send ReadyForQuery (Idle mode)
-        output.write(new byte[]{'Z', 0, 0, 0, 5, 'I'});
-        output.flush();
+    private void handleSync(OutputStream output) throws IOException {
+        // Send ReadyForQuery with correct transaction status
+        sendReadyForQuery(output, inTransaction ? 'T' : 'I');
     }
 
     private void sendAuthenticationOk(OutputStream output) throws IOException {
@@ -313,6 +418,9 @@ class ClientHandler implements Runnable {
         sendParameterStatus(output, "client_encoding", "UTF8");
         sendParameterStatus(output, "server_version", "14.2"); // Must be set to avoid errors
         sendParameterStatus(output, "server_version_num", "140002");
+        sendParameterStatus(output, "DateStyle", "ISO, MDY");
+        sendParameterStatus(output, "integer_datetimes", "on");
+        sendParameterStatus(output, "TimeZone", "UTC");
 
         // Send ReadyForQuery (Idle mode)
         output.write(new byte[]{
@@ -329,7 +437,7 @@ class ClientHandler implements Runnable {
             if (b == 0) break;
             byteArrayOutputStream.write(b);
         }
-        return new String(byteArrayOutputStream.toByteArray(), StandardCharsets.UTF_8);
+        return byteArrayOutputStream.toString(StandardCharsets.UTF_8);
     }
 
     private void sendParameterStatus(OutputStream output, String key, String value) throws IOException {
@@ -346,7 +454,6 @@ class ClientHandler implements Runnable {
         buffer.put(parameterBytes);
 
         output.write(buffer.array());
-        output.flush();
     }
 
     private void handleQuery(InputStream input, OutputStream output) throws IOException, SQLException {
@@ -357,65 +464,297 @@ class ClientHandler implements Runnable {
         byte[] queryBytes = new byte[length - 4];
         input.read(queryBytes);
         String query = new String(queryBytes, StandardCharsets.UTF_8).trim();
+        // Remove null terminator if present
+        if (query.endsWith("\0")) {
+            query = query.substring(0, query.length() - 1);
+        }
 
         System.out.println("Received query: " + query);
 
-        // Extract the command name (first keyword of the SQL query)
+        // Extract the command name
         String command = query.split("\\s+")[0].toUpperCase();
 
-        // Execute query on both databases
-        try (Connection pgConn = DriverManager.getConnection("jdbc:postgresql://localhost:5432/postgres", "postgres", "postgres");
-             Connection ybConn = DriverManager.getConnection("jdbc:postgresql://localhost:5433/yugabyte", "postgres", "postgres");
-             Statement pgStmt = pgConn.createStatement();
-             Statement ybStmt = ybConn.createStatement()) {
+        boolean isTransactionCommand = command.equals("BEGIN") || command.equals("COMMIT") ||
+                command.equals("ROLLBACK") || command.equals("SAVEPOINT") ||
+                command.equals("RELEASE");
 
-            boolean isQuery = pgStmt.execute(query);
-            boolean isQueryYB = ybStmt.execute(query);
+        System.out.println("Transaction state before query: " + (inTransaction ? "ACTIVE" : "INACTIVE"));
 
-            if (isQuery && isQueryYB) {
-                ResultSet pgResult = pgStmt.getResultSet();
-                ResultSet ybResult = ybStmt.getResultSet();
+        // Update transaction state
+        if (command.equals("BEGIN")) {
+            inTransaction = true;
+        } else if (command.equals("COMMIT") || command.equals("ROLLBACK")) {
+            inTransaction = false;
+        }
 
-                if (!query.contains("pg_") && !compareResults(pgResult, ybResult)) {
-                    System.err.println("Results differ for query: " + query);
-                }
+        // Handle empty or special queries
+        if (query.trim().isEmpty()) {
+            sendCommandComplete(output, "EMPTY");
+            sendReadyForQuery(output, inTransaction ? 'T' : 'I');
+            return;
+        }
 
-                sendResultsToClient(output, pgResult);
-            } else {
-                int pgUpdate = pgStmt.getUpdateCount();
-                int ybUpdate = ybStmt.getUpdateCount();
+        // Reconnect if needed
+        reconnectIfNeeded();
 
-                if (!query.contains("pg_") && pgUpdate != ybUpdate) {
-                    System.err.println("Update results differ for query: " + query);
-                }
+        // Ensure queries use the same connection inside a transaction
+        if (inTransaction) {
+            pgConnection.setAutoCommit(false);
+            ybConnection.setAutoCommit(false);
+            System.out.println("autoCommit remains FALSE inside transaction.");
+        }
 
-                sendUpdateToClient(output, command, pgUpdate);
+        // Prevent SAVEPOINT outside transactions
+        if (command.equals("SAVEPOINT") && !inTransaction) {
+            sendErrorToClient(output, "SAVEPOINT can only be used in transaction blocks");
+            return;
+        }
+
+        // Special handling for transaction commands
+        if (isTransactionCommand) {
+            try {
+                handleTransaction(output, pgConnection, ybConnection, query, command);
+                System.out.println("Transaction state after query: " + (inTransaction ? "ACTIVE" : "INACTIVE"));
+                return;
+            } catch (SQLException e) {
+                sendErrorToClient(output, e.getMessage());
+                return;
             }
-        } catch (SQLException e) {
+        }
+
+        // Handle regular queries
+        try {
+            // Execute query on both databases
+            boolean pgSuccess = true;
+            boolean ybSuccess = true;
+            SQLException pgException = null;
+            SQLException ybException = null;
+            boolean isQuery = false;
+            boolean isQueryYB = false;
+
+            // Execute on PostgreSQL
+            try (Statement pgStmt = pgConnection.createStatement()) {
+                isQuery = pgStmt.execute(query);
+
+                // If it's a SELECT query
+                if (isQuery) {
+                    ResultSet pgResult = pgStmt.getResultSet();
+
+                    // Execute on YugabyteDB
+                    try (Statement ybStmt = ybConnection.createStatement()) {
+                        isQueryYB = ybStmt.execute(query);
+                        ResultSet ybResult = ybStmt.getResultSet();
+
+                        // Compare results if not a system query
+                        if (!query.toLowerCase().contains("pg_") &&
+                                resultsDifferent(pgResult, ybResult)) {
+                            System.err.println("Inconsistent! Results differ for query: " + query);
+                        }
+
+                        // Send PostgreSQL results to client
+                        sendResultsToClient(output, pgResult);
+                    } catch (SQLException e) {
+                        ybSuccess = false;
+                        ybException = e;
+                        System.err.println("YugabyteDB Error: " + e.getMessage());
+
+                        // Still send PostgreSQL results to client
+                        sendResultsToClient(output, pgResult);
+                    }
+                } else {
+                    // It's an UPDATE/INSERT/DELETE query
+                    int pgUpdateCount = pgStmt.getUpdateCount();
+
+                    // Execute on YugabyteDB
+                    try (Statement ybStmt = ybConnection.createStatement()) {
+                        ybStmt.execute(query);
+                        int ybUpdateCount = ybStmt.getUpdateCount();
+
+                        System.out.println("PostgreSQL updated rows: " + pgUpdateCount);
+                        System.out.println("YugabyteDB updated rows: " + ybUpdateCount);
+
+                        sendUpdateToClient(output, command, pgUpdateCount, inTransaction ? 'T' : 'I');
+                    } catch (SQLException e) {
+                        ybSuccess = false;
+                        ybException = e;
+                        System.err.println("YugabyteDB Error: " + e.getMessage());
+
+                        sendUpdateToClient(output, command, pgUpdateCount, inTransaction ? 'T' : 'I');
+                    }
+                }
+            } catch (SQLException e) {
+                pgSuccess = false;
+                pgException = e;
+                System.err.println("PostgreSQL Error: " + e.getMessage());
+
+                // Try YugabyteDB
+                try (Statement ybStmt = ybConnection.createStatement()) {
+                    isQueryYB = ybStmt.execute(query);
+
+                    if (isQueryYB) {
+                        // It's a SELECT query
+                        ResultSet ybResult = ybStmt.getResultSet();
+                        sendResultsToClient(output, ybResult);
+                    } else {
+                        // It's an UPDATE/INSERT/DELETE query
+                        int ybUpdateCount = ybStmt.getUpdateCount();
+                        sendUpdateToClient(output, command, ybUpdateCount, inTransaction ? 'T' : 'I');
+                    }
+                } catch (SQLException yb_e) {
+                    ybSuccess = false;
+                    ybException = yb_e;
+                    System.err.println("YugabyteDB Error: " + yb_e.getMessage());
+
+                    // Both databases failed
+                    if (!pgSuccess && !ybSuccess) {
+                        if (!ybException.getMessage().equals(pgException.getMessage())) {
+                            sendErrorToClient(output, "ERROR in PostgreSQL: " + pgException.getMessage() +
+                                    "\nERROR in YugabyteDB: " + ybException.getMessage());
+                        } else {
+                            sendErrorToClient(output, pgException.getMessage());
+                        }
+                    }
+                }
+            }
+
+            // Check for inconsistent results
+            if (pgSuccess != ybSuccess) {
+                System.err.println("Inconsistent query behavior between PostgreSQL and YugabyteDB!");
+                if (!pgSuccess) {
+                    System.err.println("PostgreSQL failed but YugabyteDB succeeded.");
+                } else {
+                    System.err.println("YugabyteDB failed but PostgreSQL succeeded.");
+                }
+                // Note: We've already sent results from whichever database succeeded
+            }
+
+        } catch (Exception e) {
             System.err.println("Database error: " + e.getMessage());
             sendErrorToClient(output, e.getMessage());
         }
     }
 
+    private void handleTransaction(OutputStream output, Connection pgConn, Connection ybConn, String query, String command) throws IOException, SQLException {
+        System.out.println("Handling transaction command: " + command);
 
-    private boolean compareResults(ResultSet rs1, ResultSet rs2) throws SQLException {
+        // BEGIN transaction
+        if (command.equalsIgnoreCase("BEGIN")) {
+            pgConn.setAutoCommit(false);
+            ybConn.setAutoCommit(false);
+            inTransaction = true;
+            System.out.println("Transaction started, autoCommit is now FALSE.");
+        }
+
+        try (Statement pgStmt = pgConn.createStatement();
+             Statement ybStmt = ybConn.createStatement()) {
+
+            // If it's a SAVEPOINT, ensure it's inside a transaction
+            if (command.startsWith("SAVEPOINT") && !inTransaction) {
+                sendErrorToClient(output, "SAVEPOINT can only be used inside transactions");
+                return;
+            }
+
+            // Execute transaction command on both databases
+            pgStmt.execute(query);
+            ybStmt.execute(query);
+
+            // COMMIT or ROLLBACK
+            if (command.equalsIgnoreCase("COMMIT")) {
+                pgConn.commit();
+                ybConn.commit();
+                pgConn.setAutoCommit(true);
+                ybConn.setAutoCommit(true);
+                inTransaction = false;
+                System.out.println("Transaction committed.");
+            } else if (command.equalsIgnoreCase("ROLLBACK")) {
+                pgConn.rollback();
+                ybConn.rollback();
+                pgConn.setAutoCommit(true);
+                ybConn.setAutoCommit(true);
+                inTransaction = false;
+                System.out.println("Transaction rolled back.");
+            }
+
+            sendCommandComplete(output, command);
+            sendReadyForQuery(output, inTransaction ? 'T' : 'I');
+
+        } catch (SQLException e) {
+            System.err.println("Transaction error: " + e.getMessage());
+            rollbackTransactions(pgConn, ybConn);
+            throw e;
+        }
+    }
+
+    private void rollbackTransactions(Connection pgConn, Connection ybConn) {
+        try {
+            if (pgConn != null && !pgConn.getAutoCommit()) {
+                pgConn.rollback();
+                pgConn.setAutoCommit(true);
+            }
+        } catch (SQLException ex) {
+            System.err.println("PostgreSQL rollback failed: " + ex.getMessage());
+        }
+
+        try {
+            if (ybConn != null && !ybConn.getAutoCommit()) {
+                ybConn.rollback();
+                ybConn.setAutoCommit(true);
+            }
+        } catch (SQLException ex) {
+            System.err.println("YugabyteDB rollback failed: " + ex.getMessage());
+        }
+
+        inTransaction = false;
+        System.out.println("Rollback attempted.");
+    }
+
+    private boolean resultsDifferent(ResultSet rs1, ResultSet rs2) throws SQLException {
+        ResultSetMetaData metaData1 = rs1.getMetaData();
+        ResultSetMetaData metaData2 = rs2.getMetaData();
+
+        // Compare column count
+        if (metaData1.getColumnCount() != metaData2.getColumnCount()) {
+            return true;
+        }
+
+        // Create copies of the result sets to avoid consuming them
+        rs1.beforeFirst();
+        rs2.beforeFirst();
+
+        // Compare row by row
         while (rs1.next() && rs2.next()) {
-            for (int i = 1; i <= rs1.getMetaData().getColumnCount(); i++) {
+            for (int i = 1; i <= metaData1.getColumnCount(); i++) {
                 Object val1 = rs1.getObject(i);
                 Object val2 = rs2.getObject(i);
-                if (!val1.equals(val2)) {
-                    return false;
+
+                // Handle null values
+                if (val1 == null && val2 == null) {
+                    continue;
+                }
+
+                if (val1 == null || val2 == null || !val1.equals(val2)) {
+                    return true;
                 }
             }
         }
-        return true;
+
+        // Check if one result set has more rows than the other
+        if (rs1.next() || rs2.next()) {
+            return true;
+        }
+
+        // Reset to beginning for subsequent use
+        rs1.beforeFirst();
+        rs2.beforeFirst();
+
+        return false;
     }
 
     private void sendResultsToClient(OutputStream output, ResultSet rs) throws SQLException, IOException {
         ResultSetMetaData metaData = rs.getMetaData();
         int columnCount = metaData.getColumnCount();
 
-        System.out.println("📢 Sending SELECT results: " + columnCount + " columns");
+        System.out.println("Sending SELECT results: " + columnCount + " columns");
 
         // Build RowDescription (T) message
         ByteArrayOutputStream rowDescStream = new ByteArrayOutputStream();
@@ -432,8 +771,11 @@ class ClientHandler implements Runnable {
             columnData.write(intToBytes(0)); // Table OID (set to 0)
             columnData.write(shortToBytes(0)); // Column attribute number
 
-            columnData.write(intToBytes(23)); // Data type OID (23 = int4 for now)
-            columnData.write(shortToBytes(4)); // Data type size (int4 = 4 bytes)
+            int pgType = convertJdbcTypeToPgType(metaData.getColumnType(i));
+            int columnSize = metaData.getColumnDisplaySize(i);
+
+            columnData.write(intToBytes(pgType)); // PostgreSQL Type OID
+            columnData.write(shortToBytes(columnSize > 0 ? columnSize : 0)); // Column size
             columnData.write(intToBytes(-1)); // Type modifier (-1 means none)
             columnData.write(shortToBytes(0)); // Format code (0 = text)
         }
@@ -461,13 +803,12 @@ class ClientHandler implements Runnable {
             rowData.write(shortToBytes(columnCount)); // Number of columns
 
             for (int i = 1; i <= columnCount; i++) {
-                String value = rs.getString(i);
-                System.out.println("📢 Row " + rowCount + ", Column " + i + ": " + value);
+                Object value = rs.getObject(i);
 
                 if (value == null) {
                     rowData.write(intToBytes(-1)); // NULL value
                 } else {
-                    byte[] valueBytes = value.getBytes(StandardCharsets.UTF_8);
+                    byte[] valueBytes = value.toString().getBytes(StandardCharsets.UTF_8);
                     rowData.write(intToBytes(valueBytes.length));
                     rowData.write(valueBytes);
                 }
@@ -482,24 +823,77 @@ class ClientHandler implements Runnable {
             output.write(dataRowStream.toByteArray());
         }
 
-        System.out.println("✅ Sent " + rowCount + " rows to client");
+        System.out.println("Sent " + rowCount + " rows to client");
 
         // Send CommandComplete (C)
-        sendUpdateToClient(output, "SELECT", rowCount);
+        sendCommandComplete(output, "SELECT " + rowCount);
+
+        // Send ReadyForQuery (Z) with correct transaction state
+        sendReadyForQuery(output, inTransaction ? 'T' : 'I');
     }
 
+    // Convert JDBC types to PostgreSQL OIDs
+    private int convertJdbcTypeToPgType(int jdbcType) {
+        switch (jdbcType) {
+            case Types.BOOLEAN:
+                return 16; // bool
+            case Types.SMALLINT:
+                return 21; // int2
+            case Types.INTEGER:
+                return 23; // int4
+            case Types.BIGINT:
+                return 20; // int8
+            case Types.REAL:
+                return 700; // float4
+            case Types.FLOAT:
+            case Types.DOUBLE:
+                return 701; // float8
+            case Types.NUMERIC:
+            case Types.DECIMAL:
+                return 1700; // numeric
+            case Types.CHAR:
+                return 18; // char
+            case Types.VARCHAR:
+                return 1043; // varchar
+            case Types.DATE:
+                return 1082; // date
+            case Types.TIME:
+                return 1083; // time
+            case Types.TIMESTAMP:
+                return 1114; // timestamp
+            case Types.BINARY:
+            case Types.VARBINARY:
+                return 17; // bytea
+            case Types.OTHER:
+                return 25; // text (default)
+            default:
+                return 25; // text
+        }
+    }
 
-    private void sendUpdateToClient(OutputStream output, String command, int updateCount) throws IOException {
+    private void sendUpdateToClient(OutputStream output, String command, int updateCount, char transactionStatus) throws IOException {
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
 
         buffer.write('C'); // CommandComplete message type
 
-        // Construct the correct command tag based on command type
+        // Handle transaction messages properly
         String commandTag;
         if (command.equalsIgnoreCase("INSERT")) {
-            commandTag = "INSERT 0 " + updateCount; // PostgreSQL expects "INSERT OID COUNT"
+            commandTag = "INSERT 0 " + updateCount;
+        } else if (command.equalsIgnoreCase("UPDATE")) {
+            commandTag = "UPDATE " + updateCount;
+        } else if (command.equalsIgnoreCase("DELETE")) {
+            commandTag = "DELETE " + updateCount;
+        } else if (command.equalsIgnoreCase("EXECUTE")) {
+            commandTag = "EXECUTE";
+        } else if (command.equalsIgnoreCase("BEGIN")) {
+            commandTag = "BEGIN";
+        } else if (command.equalsIgnoreCase("COMMIT")) {
+            commandTag = "COMMIT";
+        } else if (command.equalsIgnoreCase("ROLLBACK")) {
+            commandTag = "ROLLBACK";
         } else {
-            commandTag = command.toUpperCase() + " " + updateCount; // UPDATE, DELETE, etc.
+            commandTag = command.toUpperCase() + " " + updateCount;
         }
 
         byte[] commandBytes = commandTag.getBytes(StandardCharsets.UTF_8);
@@ -511,14 +905,14 @@ class ClientHandler implements Runnable {
         buffer.write(commandBytes);
         buffer.write(0); // Null terminator
 
+        System.out.println("Sending CommandComplete: " + commandTag);
+
         output.write(buffer.toByteArray());
         output.flush();
 
-        // 🚀 Send ReadyForQuery (Z) to properly end the transaction 🚀
-        output.write(new byte[]{'Z', 0, 0, 0, 5, 'I'}); // ReadyForQuery: idle transaction state
-        output.flush();
+        // Send ReadyForQuery with correct transaction state
+        sendReadyForQuery(output, transactionStatus);
     }
-
 
     private void sendErrorToClient(OutputStream output, String errorMessage) throws IOException {
         ByteArrayOutputStream errorStream = new ByteArrayOutputStream();
@@ -542,11 +936,6 @@ class ClientHandler implements Runnable {
         errorContent.write("42601".getBytes(StandardCharsets.UTF_8));
         errorContent.write(0); // Null terminator
 
-        // Position field (P = Position of error in query, optional)
-        errorContent.write('P');
-        errorContent.write("26".getBytes(StandardCharsets.UTF_8));
-        errorContent.write(0); // Null terminator
-
         // End of error message (final 0 byte)
         errorContent.write(0);
 
@@ -564,9 +953,42 @@ class ClientHandler implements Runnable {
         output.write(errorStream.toByteArray());
         output.flush();
 
-        // 🚀 Send ReadyForQuery (Z) to properly close the error response 🚀
-        output.write(new byte[]{'Z', 0, 0, 0, 5, 'I'}); // ReadyForQuery: idle transaction state
+        // Send ReadyForQuery (Z) to properly close the error response
+        sendReadyForQuery(output, inTransaction ? 'T' : 'I');
+    }
+
+    private void sendCommandComplete(OutputStream output, String commandTag) throws IOException {
+        byte[] commandBytes = commandTag.getBytes(StandardCharsets.UTF_8);
+        int messageLength = 4 + commandBytes.length + 1; // 4 bytes for length + command + null terminator
+
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        buffer.write('C'); // CommandComplete message type
+        buffer.write(intToBytes(messageLength)); // Message length
+        buffer.write(commandBytes);
+        buffer.write(0); // Null terminator
+
+        System.out.println("Sending CommandComplete: " + commandTag);
+
+        output.write(buffer.toByteArray());
         output.flush();
+    }
+
+    private void sendReadyForQuery(OutputStream output, char transactionStatus) throws IOException {
+        System.out.println("Sending ReadyForQuery: " + transactionStatus);
+        output.write(new byte[]{
+                'Z', 0, 0, 0, 5, (byte) transactionStatus
+        });
+        output.flush();
+    }
+
+    private String readNullTerminatedString(InputStream input) throws IOException {
+        ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+        while (true) {
+            int b = input.read();
+            if (b == 0 || b == -1) break; // Stop at null terminator
+            byteArrayOutputStream.write(b);
+        }
+        return byteArrayOutputStream.toString(StandardCharsets.UTF_8);
     }
 
     private byte[] intToBytes(int value) {
