@@ -5,9 +5,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.sql.*;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -108,14 +110,16 @@ class ClientHandler implements Runnable {
                         handleDescribe(input, output);
                         break;
                     case 'S': // Sync
-                        handleSync(output);
+                        handleSync(input, output);
                         break;
                     case 'X': // Termination
                         System.out.println("Client requested termination.");
                         return;
                     default:
-                        System.err.println("Unknown message type: " + (char) messageType);
-                        skipUnknownMessage(input); // Skip unknown message
+                        System.err.println("Unknown message type: " + messageType + " (" + (char) messageType + ")");
+                        logUnknownMessageContent(input);
+                        skipUnknownMessage(input);
+                        return;
                 }
             }
         } catch (IOException | SQLException e) {
@@ -123,6 +127,58 @@ class ClientHandler implements Runnable {
         } finally {
             closeConnections();
         }
+    }
+
+    private void logUnknownMessageContent(InputStream input) throws IOException {
+        // Read the message length
+        byte[] lengthBytes = new byte[4];
+        if (input.read(lengthBytes) != 4) {
+            System.err.println("Failed to read length of unknown message.");
+            return;
+        }
+
+        // Parse length as unsigned int
+        int length = parseUnsignedInt(lengthBytes) - 4; // Subtract 4 for the length field itself
+
+        // Validate length (reasonable range: 1 to 8 MB)
+        final int MAX_MESSAGE_LENGTH = 8 * 1024 * 1024; // 8 MB
+        if (length <= 0 || length > MAX_MESSAGE_LENGTH) {
+            System.err.println("Invalid or malformed message length: " + length + ". Skipping.");
+            input.skip(4); // Skip the invalid length field to recover
+            return;
+        }
+
+        // Check if sufficient bytes are available
+        int availableBytes = input.available();
+        if (length > availableBytes) {
+            System.err.println("Malformed message: Declared length (" + length +
+                    ") exceeds available bytes (" + availableBytes + "). Skipping.");
+            input.skip(availableBytes); // Skip remaining available bytes
+            return;
+        }
+
+        // Read the message content with a timeout
+        try {
+            byte[] content = input.readNBytes(length);
+            System.err.println("Unknown message content (hex): " + bytesToHex(content));
+        } catch (SocketTimeoutException e) {
+            System.err.println("Socket timeout while reading unknown message content. Skipping.");
+        }
+    }
+
+    private int parseUnsignedInt(byte[] bytes) {
+        return (bytes[0] & 0xFF) << 24 |
+                (bytes[1] & 0xFF) << 16 |
+                (bytes[2] & 0xFF) << 8 |
+                (bytes[3] & 0xFF);
+    }
+
+    private String bytesToHex(byte[] bytes) {
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : bytes) {
+            hexString.append(String.format("%02x ", b));
+        }
+        return hexString.toString();
     }
 
     private void closeConnections() {
@@ -374,14 +430,22 @@ class ClientHandler implements Runnable {
 
     private void skipUnknownMessage(InputStream input) throws IOException {
         byte[] lengthBytes = new byte[4];
+
+        // Read message length safely
         if (input.read(lengthBytes) != 4) {
             System.err.println("Failed to read message length.");
             return;
         }
+
         int length = ByteBuffer.wrap(lengthBytes).getInt() - 4;
-        if (length > 0) {
-            input.readNBytes(length); // Skip the remaining bytes
+
+        if (length < 0 || length > 10000) {  // Prevent absurdly large values
+            System.err.println("Skipping invalid message length: " + length);
+            return;
         }
+
+        // Read and discard the full message to keep stream aligned
+        input.readNBytes(length);
     }
 
     private void handleDescribe(InputStream input, OutputStream output) throws IOException {
@@ -391,21 +455,36 @@ class ClientHandler implements Runnable {
         int length = ByteBuffer.wrap(lengthBytes).getInt() - 4;
 
         // Read type (S = Statement, P = Portal)
-        byte describeType = (byte)input.read();
+        byte describeType = (byte) input.read();
 
         // Read name (null-terminated string)
         String name = readNullTerminatedString(input);
 
-        System.out.println("Describe: " + (char)describeType + " " + name);
+        System.out.println("Describe: " + (char) describeType + " " + name);
 
         // Send NoData response for now
         output.write(new byte[]{'n', 0, 0, 0, 4});
         output.flush();
     }
 
-    private void handleSync(OutputStream output) throws IOException {
-        // Send ReadyForQuery with correct transaction status
-        sendReadyForQuery(output, inTransaction ? 'T' : 'I');
+    private void handleSync(InputStream input, OutputStream output) throws IOException {
+        // Read the 4-byte length field (should always be 4 for Sync)
+        byte[] lengthBytes = new byte[4];
+        if (input.read(lengthBytes) != 4) {
+            System.err.println("Failed to read Sync message length.");
+            return;
+        }
+
+        int length = ByteBuffer.wrap(lengthBytes).getInt();
+        if (length != 4) {
+            System.err.println("Invalid Sync message length: " + length);
+            return;
+        }
+
+        System.out.println("✅ Sync message received. Resetting transaction state.");
+
+        // Send a ReadyForQuery (Z) message with transaction state 'I' (Idle)
+        sendReadyForQuery(output, 'I');
     }
 
     private void sendAuthenticationOk(OutputStream output) throws IOException {
