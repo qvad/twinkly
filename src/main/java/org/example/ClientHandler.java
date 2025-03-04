@@ -9,7 +9,6 @@ import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.sql.*;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -88,7 +87,8 @@ class ClientHandler implements Runnable {
 
                 // Ignore null bytes (\0) which are not valid message types
                 if (messageType == 0) {
-                    continue;
+                    handleStartupMessage(input, output);
+                    return;
                 }
 
                 System.out.println("Received message type: " + (char) messageType);
@@ -127,6 +127,81 @@ class ClientHandler implements Runnable {
         } finally {
             closeConnections();
         }
+    }
+
+    private void handleStartupMessage(InputStream input, OutputStream output) throws IOException {
+        // Read the 4-byte length field
+        byte[] lengthBytes = new byte[4];
+        if (input.read(lengthBytes) != 4) {
+            System.err.println("Failed to read StartupMessage length.");
+            return;
+        }
+
+        int length = ByteBuffer.wrap(lengthBytes).getInt();
+        if (length <= 8) { // Minimum length is 8 (4 bytes for length + 4 bytes for protocol version)
+            System.err.println("Invalid StartupMessage length: " + length);
+            return;
+        }
+
+        // Read the 4-byte protocol version
+        byte[] protocolBytes = new byte[4];
+        if (input.read(protocolBytes) != 4) {
+            System.err.println("Failed to read protocol version.");
+            return;
+        }
+
+        int protocolVersion = ByteBuffer.wrap(protocolBytes).getInt();
+        System.out.println("✅ StartupMessage received. Protocol version: " + protocolVersion);
+
+        // Check if this is a valid PostgreSQL startup message (protocol version 3.0)
+        if (protocolVersion != 196608) {
+            System.err.println("Unsupported protocol version: " + protocolVersion);
+            return;
+        }
+
+        // Parse the key-value pairs
+        HashMap<String, String> startupParams = new HashMap<>();
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        int b;
+        while ((b = input.read()) != -1) { // Read until a null terminator
+            if (b == 0) {
+                String param = buffer.toString(StandardCharsets.UTF_8);
+                buffer.reset();
+
+                if (param.isEmpty()) break; // End of key-value pairs
+                String value = buffer.toString(StandardCharsets.UTF_8);
+
+                // Store the key-value pair
+                startupParams.put(param, value);
+            } else {
+                buffer.write(b);
+            }
+        }
+
+        String user = startupParams.get("user");
+        String database = startupParams.get("database");
+        System.out.println("✅ Parsed StartupMessage: user = " + user + ", database = " + database);
+
+        Properties props = new Properties();
+        props.setProperty("user", "postgres");
+        props.setProperty("password", "postgres");
+
+        // Close existing PostgreSQL and YugabyteDB connections
+        closeConnections();
+
+        try {
+            // Reinitialize connections to the new database
+            pgConnection = DriverManager.getConnection("jdbc:postgresql://localhost:5433/" + database, props);
+            ybConnection = DriverManager.getConnection("jdbc:postgresql://localhost:5433/" + database, props);
+        } catch (SQLException e) {
+            System.out.println("Failed to connect to database: " + e.getMessage());
+            sendErrorToClient(output, "Database switch failed: " + e.getMessage());
+        }
+
+        sendCommandComplete(output, "Database switched to " + database);
+        sendReadyForQuery(output, 'I');
+
+        System.out.println("✅ Connections re-established for user: " + user + ", database: " + database);
     }
 
     private void logUnknownMessageContent(InputStream input) throws IOException {
@@ -451,19 +526,37 @@ class ClientHandler implements Runnable {
     private void handleDescribe(InputStream input, OutputStream output) throws IOException {
         // Read message length
         byte[] lengthBytes = new byte[4];
-        input.read(lengthBytes);
+        if (input.read(lengthBytes) != 4) {
+            throw new IOException("Failed to read Describe message length.");
+        }
         int length = ByteBuffer.wrap(lengthBytes).getInt() - 4;
 
         // Read type (S = Statement, P = Portal)
-        byte describeType = (byte) input.read();
+        int typeByte = input.read();
+        if (typeByte == -1) {
+            throw new IOException("Failed to read Describe type.");
+        }
+        char describeType = (char) typeByte;
+
+        if (describeType != 'S' && describeType != 'P') {
+            throw new IOException("Invalid Describe type: " + describeType);
+        }
 
         // Read name (null-terminated string)
         String name = readNullTerminatedString(input);
 
-        System.out.println("Describe: " + (char) describeType + " " + name);
+        System.out.println("Describe: " + describeType + " " + name);
 
-        // Send NoData response for now
-        output.write(new byte[]{'n', 0, 0, 0, 4});
+        // For now, send a NoData response (n)
+        // Later, this can be extended to send RowDescription (T) if applicable
+        sendNoDataResponse(output);
+    }
+
+    private void sendNoDataResponse(OutputStream output) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(5); // Message type (1 byte) + length (4 bytes)
+        buffer.put((byte) 'n'); // NoData message type
+        buffer.putInt(4);       // Message length (4 bytes, including length field)
+        output.write(buffer.array());
         output.flush();
     }
 
@@ -613,7 +706,12 @@ class ClientHandler implements Runnable {
 
             // Execute on PostgreSQL
             try (Statement pgStmt = pgConnection.createStatement()) {
-                isQuery = pgStmt.execute(query);
+                String pgQuery = query.replace("WITH COLOCATION = true", "");
+                if (pgQuery.contains("COLOCATION = true")) {
+                    pgQuery = pgQuery.replace("COLOCATION = true", "");
+                }
+                isQuery = pgStmt.execute(pgQuery);
+
 
                 // If it's a SELECT query
                 if (isQuery) {
@@ -625,8 +723,7 @@ class ClientHandler implements Runnable {
                         ResultSet ybResult = ybStmt.getResultSet();
 
                         // Compare results if not a system query
-                        if (!query.toLowerCase().contains("pg_") &&
-                                resultsDifferent(pgResult, ybResult)) {
+                        if (resultsDifferent(pgResult, ybResult)) {
                             System.err.println("Inconsistent! Results differ for query: " + query);
                         }
 
