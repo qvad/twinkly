@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -52,12 +53,12 @@ func (s *SlowQueryAnalyzer) AnalyzeQuery(query string) (*SlowQueryResult, error)
 	
 	// Execute on PostgreSQL with timing
 	pgStart := time.Now()
-	pgPlan, pgErr := s.getExplainAnalyze(s.pgPool, query)
+	pgPlan, pgErr := s.getExplainAnalyzeForDB(s.pgPool, query, "postgresql")
 	pgDuration := time.Since(pgStart)
 	
 	// Execute on YugabyteDB with timing  
 	ybStart := time.Now()
-	ybPlan, ybErr := s.getExplainAnalyze(s.ybPool, query)
+	ybPlan, ybErr := s.getExplainAnalyzeForDB(s.ybPool, query, "yugabytedb")
 	ybDuration := time.Since(ybStart)
 	
 	result.PostgreSQLTime = pgDuration
@@ -99,9 +100,55 @@ func (s *SlowQueryAnalyzer) AnalyzeQuery(query string) (*SlowQueryResult, error)
 	return result, nil
 }
 
-// getExplainAnalyze gets EXPLAIN ANALYZE output for a query
-func (s *SlowQueryAnalyzer) getExplainAnalyze(db *sql.DB, query string) (string, error) {
-	explainQuery := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) %s", query)
+// getExplainAnalyzeForDB gets EXPLAIN ANALYZE output for a specific database
+func (s *SlowQueryAnalyzer) getExplainAnalyzeForDB(db *sql.DB, query string, dbType string) (string, error) {
+	var options ExplainOptions
+	if dbType == "postgresql" {
+		options = s.config.Comparison.ExplainOptions.PostgreSQL
+	} else {
+		options = s.config.Comparison.ExplainOptions.YugabyteDB
+	}
+	
+	// Build EXPLAIN command with configured options
+	explainParts := []string{"EXPLAIN ("}
+	optionParts := []string{}
+	
+	if options.Analyze {
+		optionParts = append(optionParts, "ANALYZE")
+	}
+	if options.Buffers {
+		optionParts = append(optionParts, "BUFFERS")
+	}
+	if options.Costs {
+		optionParts = append(optionParts, "COSTS")
+	}
+	if options.Timing {
+		optionParts = append(optionParts, "TIMING")
+	}
+	if options.Summary {
+		optionParts = append(optionParts, "SUMMARY")
+	}
+	
+	// YugabyteDB specific options
+	if dbType == "yugabytedb" {
+		if options.Dist {
+			optionParts = append(optionParts, "DIST")
+		}
+		if options.Debug {
+			optionParts = append(optionParts, "DEBUG")
+		}
+	}
+	
+	// Add format
+	optionParts = append(optionParts, fmt.Sprintf("FORMAT %s", options.Format))
+	
+	explainParts = append(explainParts, strings.Join(optionParts, ", "))
+	explainParts = append(explainParts, ") ")
+	explainParts = append(explainParts, query)
+	
+	explainQuery := strings.Join(explainParts, "")
+	
+	log.Printf("Executing EXPLAIN for %s: %s", dbType, explainQuery)
 	
 	rows, err := db.Query(explainQuery)
 	if err != nil {
@@ -123,6 +170,12 @@ func (s *SlowQueryAnalyzer) getExplainAnalyze(db *sql.DB, query string) (string,
 	}
 	
 	return plan, nil
+}
+
+// getExplainAnalyze is deprecated - use getExplainAnalyzeForDB
+func (s *SlowQueryAnalyzer) getExplainAnalyze(db *sql.DB, query string) (string, error) {
+	// Backward compatibility - defaults to PostgreSQL options
+	return s.getExplainAnalyzeForDB(db, query, "postgresql")
 }
 
 // GetSlowQuerySummary returns a summary of slow query analysis

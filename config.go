@@ -67,8 +67,30 @@ type ComparisonConfig struct {
 	SlowQueryRatio       float64
 	FailOnSlowQueries    bool
 	
+	// EXPLAIN ANALYZE options
+	ExplainOptions       ExplainAnalyzeOptions
+	
 	// Compiled exclude patterns
 	excludePatterns []*regexp.Regexp
+}
+
+// ExplainAnalyzeOptions contains database-specific EXPLAIN ANALYZE settings
+type ExplainAnalyzeOptions struct {
+	PostgreSQL ExplainOptions
+	YugabyteDB ExplainOptions
+}
+
+// ExplainOptions contains EXPLAIN ANALYZE options for a specific database
+type ExplainOptions struct {
+	Analyze bool
+	Buffers bool
+	Costs   bool
+	Timing  bool
+	Summary bool
+	Format  string
+	// YugabyteDB specific options
+	Dist    bool
+	Debug   bool
 }
 
 // FeaturesConfig contains feature compatibility mappings
@@ -254,6 +276,80 @@ func LoadConfig(filename string) (*Config, error) {
 	cfg.Comparison.ReportSlowQueries = conf.GetBoolean("comparison.report-slow-queries")
 	cfg.Comparison.SlowQueryRatio = conf.GetFloat64("comparison.slow-query-ratio")
 	cfg.Comparison.FailOnSlowQueries = conf.GetBoolean("comparison.fail-on-slow-queries")
+	
+	// EXPLAIN ANALYZE options - PostgreSQL (with defaults)
+	if conf.Get("comparison.explain-options.postgresql.analyze") != nil {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Analyze = conf.GetBoolean("comparison.explain-options.postgresql.analyze")
+	} else {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Analyze = true
+	}
+	if conf.Get("comparison.explain-options.postgresql.buffers") != nil {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Buffers = conf.GetBoolean("comparison.explain-options.postgresql.buffers")
+	} else {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Buffers = true
+	}
+	if conf.Get("comparison.explain-options.postgresql.costs") != nil {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Costs = conf.GetBoolean("comparison.explain-options.postgresql.costs")
+	} else {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Costs = true
+	}
+	if conf.Get("comparison.explain-options.postgresql.timing") != nil {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Timing = conf.GetBoolean("comparison.explain-options.postgresql.timing")
+	} else {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Timing = true
+	}
+	if conf.Get("comparison.explain-options.postgresql.summary") != nil {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Summary = conf.GetBoolean("comparison.explain-options.postgresql.summary")
+	} else {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Summary = false
+	}
+	if conf.Get("comparison.explain-options.postgresql.format") != nil {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Format = conf.GetString("comparison.explain-options.postgresql.format")
+	} else {
+		cfg.Comparison.ExplainOptions.PostgreSQL.Format = "TEXT"
+	}
+	
+	// EXPLAIN ANALYZE options - YugabyteDB (with defaults)
+	if conf.Get("comparison.explain-options.yugabytedb.analyze") != nil {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Analyze = conf.GetBoolean("comparison.explain-options.yugabytedb.analyze")
+	} else {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Analyze = true
+	}
+	if conf.Get("comparison.explain-options.yugabytedb.buffers") != nil {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Buffers = conf.GetBoolean("comparison.explain-options.yugabytedb.buffers")
+	} else {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Buffers = true
+	}
+	if conf.Get("comparison.explain-options.yugabytedb.costs") != nil {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Costs = conf.GetBoolean("comparison.explain-options.yugabytedb.costs")
+	} else {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Costs = true
+	}
+	if conf.Get("comparison.explain-options.yugabytedb.timing") != nil {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Timing = conf.GetBoolean("comparison.explain-options.yugabytedb.timing")
+	} else {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Timing = true
+	}
+	if conf.Get("comparison.explain-options.yugabytedb.summary") != nil {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Summary = conf.GetBoolean("comparison.explain-options.yugabytedb.summary")
+	} else {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Summary = false
+	}
+	if conf.Get("comparison.explain-options.yugabytedb.format") != nil {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Format = conf.GetString("comparison.explain-options.yugabytedb.format")
+	} else {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Format = "TEXT"
+	}
+	if conf.Get("comparison.explain-options.yugabytedb.dist") != nil {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Dist = conf.GetBoolean("comparison.explain-options.yugabytedb.dist")
+	} else {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Dist = true
+	}
+	if conf.Get("comparison.explain-options.yugabytedb.debug") != nil {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Debug = conf.GetBoolean("comparison.explain-options.yugabytedb.debug")
+	} else {
+		cfg.Comparison.ExplainOptions.YugabyteDB.Debug = false
+	}
 	
 	// Load and compile exclude patterns
 	excludePatterns := conf.GetStringSlice("comparison.exclude-patterns")
