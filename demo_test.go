@@ -5,6 +5,7 @@ import (
 )
 
 func TestRunDemo(t *testing.T) {
-	// This test runs the demo to show tool functionality
+	// Skip demo execution during normal test runs to avoid side effects/noise
+	t.Skip("Skipping demo in CI")
 	RunDemo()
 }

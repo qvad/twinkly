@@ -10,21 +10,23 @@ import (
 
 // SimpleProxy implements a basic PostgreSQL proxy without pgbroker dependency
 type SimpleProxy struct {
-	config     *Config
-	resolver   *DualDatabaseResolver
-	listener   net.Listener
-	shutdown   chan struct{}
-	wg         sync.WaitGroup
-	reporter   *InconsistencyReporter
-	mu         sync.Mutex
+	config   *Config
+	resolver *DualDatabaseResolver
+	listener net.Listener
+	shutdown chan struct{}
+	wg       sync.WaitGroup
+	reporter *InconsistencyReporter
+	mu       sync.Mutex
 }
 
 // NewSimpleProxy creates a new proxy instance
 func NewSimpleProxy(config *Config) *SimpleProxy {
+	rep := NewInconsistencyReporter()
+	rep.AttachConfig(config)
 	return &SimpleProxy{
 		config:   config,
 		shutdown: make(chan struct{}),
-		reporter: NewInconsistencyReporter(),
+		reporter: rep,
 	}
 }
 
@@ -39,9 +41,9 @@ func (p *SimpleProxy) Start(listenAddr string) error {
 	// Create resolver
 	postgresAddr := fmt.Sprintf("%s:%d", p.config.Proxy.PostgreSQL.Host, p.config.Proxy.PostgreSQL.Port)
 	yugabyteAddr := fmt.Sprintf("%s:%d", p.config.Proxy.YugabyteDB.Host, p.config.Proxy.YugabyteDB.Port)
-	
+
 	p.resolver = NewDualDatabaseResolver(p.config, postgresAddr, yugabyteAddr)
-	
+
 	// Initialize comparison pools if enabled
 	if p.config.Comparison.Enabled {
 		if err := p.resolver.InitializePools(); err != nil {
@@ -86,23 +88,25 @@ func (p *SimpleProxy) handleConnection(clientConn net.Conn) {
 
 	// Use the dual execution proxy with shared reporter for actual query handling
 	dualProxy := NewDualExecutionProxyWithReporter(p.config, p.reporter)
+	// Reuse the initialized resolver (with pools) for background comparisons
+	dualProxy.resolver = p.resolver
 	dualProxy.HandleConnection(clientConn)
 }
 
 // Shutdown gracefully shuts down the proxy
 func (p *SimpleProxy) Shutdown() {
 	close(p.shutdown)
-	
+
 	if p.listener != nil {
 		p.listener.Close()
 	}
-	
+
 	// Wait for all connections to finish
 	p.wg.Wait()
-	
+
 	// Generate summary report from all dual proxies
 	p.generateInconsistencyReport()
-	
+
 	// Clean up resolver
 	if p.resolver != nil {
 		if err := p.resolver.Close(); err != nil {

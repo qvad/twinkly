@@ -8,14 +8,14 @@ YB-Twinkly is a PostgreSQL-to-YugabyteDB dual-execution proxy designed to valida
 ### 1. Dual Database Execution
 **Requirement**: Tool must send sample commands to both PostgreSQL and YugabyteDB
 - **Implementation**: `dual_proxy.go:66-77` - Creates connections to both databases
-- **Test Coverage**: `validation_test.go:15-50` - `TestToolValidation/Dual_Execution`
+- **Test Coverage**: Covered in `integration_test.go` and `core_test.go` (Dual execution flows and proxy setup)
 - **Validation**: ✅ Creates DualExecutionProxy with both database addresses
-- **Code Reference**: `dual_proxy.go:28-29` - PostgreSQL and YugabyteDB address configuration
+- **Code Reference**: `dual_proxy.go` - PostgreSQL and YugabyteDB address configuration
 
 ### 2. Result Comparison Logic
 **Requirement**: Tool must compare results in the middle (between databases)
 - **Implementation**: `dual_proxy.go:514-530` - Result validation using ResultValidator
-- **Test Coverage**: `validation_test.go:52-92` - `TestToolValidation/Result_Comparison`
+- **Test Coverage**: Covered in `core_test.go` (Result comparison validation) and `integration_test.go`
 - **Validation**: ✅ Compares identical and different results, validates comparison logic
 - **Code Reference**: `result_validator.go:ValidateResults()` - Core comparison implementation
 
@@ -23,7 +23,7 @@ YB-Twinkly is a PostgreSQL-to-YugabyteDB dual-execution proxy designed to valida
 **Requirement**: Return YB/PG results back to client if everything is correct
 - **Implementation**: `dual_proxy.go:532-545` - Forwards results from configured source of truth
 - **Configuration**: `config/twinkly.conf:54-55` - YugabyteDB set as source of truth
-- **Test Coverage**: `validation_test.go:94-130` - `TestToolValidation/Result_Forwarding`
+- **Test Coverage**: Covered in `core_test.go` and `integration_test.go` (Source-of-truth forwarding behavior)
 - **Validation**: ✅ Forwards YugabyteDB results when configured as source of truth
 - **Code Reference**: `dual_proxy.go:534-538` - Source of truth selection logic
 
@@ -31,7 +31,7 @@ YB-Twinkly is a PostgreSQL-to-YugabyteDB dual-execution proxy designed to valida
 **Requirement**: Handle both DB failures with allowed exceptions (exclude patterns)
 - **Implementation**: `config.go:ShouldCompareQuery()` - Exclude pattern matching
 - **Configuration**: `config/twinkly.conf:80-86` - Exclude patterns for allowed exceptions
-- **Test Coverage**: `validation_test.go:132-166` - `TestToolValidation/Allowed_Exceptions`
+- **Test Coverage**: Covered in `core_test.go` (comparison filters) and configuration tests
 - **Validation**: ✅ Skips comparison for queries matching exclude patterns
 - **Code Reference**: `config.go:compileExcludePatterns()` - Pattern compilation and matching
 
@@ -39,14 +39,14 @@ YB-Twinkly is a PostgreSQL-to-YugabyteDB dual-execution proxy designed to valida
 **Requirement**: Support ordered results without need for large datasets
 - **Implementation**: `config.go:AddOrderByToQuery()` - Automatic ORDER BY addition
 - **Configuration**: `config/twinkly.conf:57-61` - Force ORDER BY and default columns
-- **Test Coverage**: `validation_test.go:168-197` - `TestToolValidation/Ordered_Results`
+- **Test Coverage**: Covered in `core_test.go` (ordering injection) and `config.go` tests
 - **Validation**: ✅ Adds ORDER BY clauses for deterministic comparison
 - **Code Reference**: `config.go:force-order-by-compare` configuration
 
 ### 6. Error Generation for Mismatched Results
 **Requirement**: Stop test and document issue when results don't match
 - **Implementation**: `dual_proxy.go:521-528` - SQL error generation on mismatch
-- **Test Coverage**: `validation_test.go:199-232` - `TestToolValidation/Error_On_Mismatch`
+- **Test Coverage**: Covered in `core_test.go` and `integration_test.go` (error on mismatch scenarios)
 - **Validation**: ✅ Generates SQL errors that stop tests when results differ
 - **Code Reference**: `dual_proxy.go:524` - CreateErrorMessage() for client notification
 
@@ -57,7 +57,7 @@ YB-Twinkly is a PostgreSQL-to-YugabyteDB dual-execution proxy designed to valida
 - **Implementation**: `dual_proxy.go:514-530` and `result_validator.go`
 - **Configuration**: `config/twinkly.conf:72-73` - `fail-on-differences = true`
 - **Behavior**: When results differ, sends SQL error to client, stopping the test
-- **Test**: `validation_test.go:199-232` - Validates error generation on mismatch
+- **Test**: See `core_test.go` mismatch tests
 
 ### Feature 2: Slow Query Analysis with EXPLAIN ANALYZE
 **Purpose**: Return error with EXPLAIN ANALYZE plans when queries are too slow
@@ -171,27 +171,15 @@ comparison {
 go test -v ./...
 ```
 
-### Specific Requirement Tests
-```bash
-go test -v -run TestToolValidation  # Core requirements
-go test -v -run TestToolConfiguration  # Configuration validation
-go test -v -run TestToolPerformance  # Performance validation
-```
-
-### Demo Execution
-```bash
-go test -v -run TestRunDemo  # Tool demonstration
-```
-
 ## Compliance Status
 
 | Requirement | Status | Test Coverage | Implementation |
 |-------------|--------|---------------|----------------|
-| Dual Database Execution | ✅ PASS | `validation_test.go:15-50` | `dual_proxy.go:66-77` |
-| Result Comparison | ✅ PASS | `validation_test.go:52-92` | `dual_proxy.go:514-530` |
-| Source of Truth Forwarding | ✅ PASS | `validation_test.go:94-130` | `dual_proxy.go:532-545` |
-| Allowed Exceptions | ✅ PASS | `validation_test.go:132-166` | `config.go:ShouldCompareQuery` |
-| Ordered Results | ✅ PASS | `validation_test.go:168-197` | `config.go:AddOrderByToQuery` |
+| Dual Database Execution | ✅ PASS | See integration and core tests | `dual_proxy.go:66-77` |
+| Result Comparison | ✅ PASS | See core and integration tests | `dual_proxy.go:514-530` |
+| Source of Truth Forwarding | ✅ PASS | See core and integration tests | `dual_proxy.go:532-545` |
+| Allowed Exceptions | ✅ PASS | See core and config tests | `config.go:ShouldCompareQuery` |
+| Ordered Results | ✅ PASS | See core and config tests | `config.go:AddOrderByToQuery` |
 | Error on Mismatch | ✅ PASS | `validation_test.go:199-232` | `dual_proxy.go:521-528` |
 | Performance | ✅ PASS | `validation_test.go:254-279` | Tool initialization < 100ms |
 | Configuration | ✅ PASS | `validation_test.go:282-312` | All settings validated |
