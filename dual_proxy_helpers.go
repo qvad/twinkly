@@ -1,10 +1,16 @@
 package main
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
-// collectQueryResults collects all messages until ReadyForQuery
+// collectQueryResults collects all messages until ReadyForQuery.
+// It also detects SQL ErrorResponse frames and returns a synthesized error
+// that includes severity, SQLSTATE code, and message for higher-level handling.
 func (p *DualExecutionProxy) collectQueryResults(reader *PGProtocolReader) ([]*PGMessage, error) {
 	var results []*PGMessage
+	var firstErr error
 
 	for {
 		msg, err := reader.ReadMessage()
@@ -14,13 +20,34 @@ func (p *DualExecutionProxy) collectQueryResults(reader *PGProtocolReader) ([]*P
 
 		results = append(results, msg)
 
+		// Capture SQL errors so callers can detect failure vs success
+		if msg.Type == msgTypeErrorResponse && firstErr == nil {
+			sev, code, text := parseBackendError(msg.Data)
+			// Build a readable error; include fields when available
+			parts := make([]string, 0, 3)
+			if sev != "" {
+				parts = append(parts, sev)
+			}
+			if code != "" {
+				parts = append(parts, code)
+			}
+			if text != "" {
+				parts = append(parts, text)
+			}
+			if len(parts) == 0 {
+				firstErr = fmt.Errorf("backend returned ErrorResponse")
+			} else {
+				firstErr = fmt.Errorf(strings.Join(parts, " "))
+			}
+		}
+
 		// Check if this is the end of results
 		if msg.Type == msgTypeReadyForQuery {
 			break
 		}
 	}
 
-	return results, nil
+	return results, firstErr
 }
 
 // extractDataRows extracts DataRow messages from a list of protocol messages
@@ -40,6 +67,21 @@ func (p *DualExecutionProxy) GetReporter() *InconsistencyReporter {
 }
 
 // isTransportError returns true if the error indicates a connection/transport failure rather than a SQL error.
+// isSyntaxError returns true if error indicates a SQL syntax error (SQLSTATE 42601 or contains 'syntax error').
+func isSyntaxError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "42601") {
+		return true
+	}
+	if strings.Contains(s, "syntax error") {
+		return true
+	}
+	return false
+}
+
 func isTransportError(err error) bool {
 	if err == nil {
 		return false

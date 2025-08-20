@@ -57,7 +57,7 @@ func (r *DualDatabaseResolver) GetPGConn(ctx context.Context, clientAddr net.Add
 		return nil, fmt.Errorf("connection validation failed: %w", err)
 	}
 
-	// For now, always route to the source of truth (PostgreSQL)
+	// Route to the configured source of truth backend
 	// The comparison will happen at the query level through our custom handler
 	log.Printf("Routing connection to %s for database: %s", r.config.Comparison.SourceOfTruth, parameters["database"])
 

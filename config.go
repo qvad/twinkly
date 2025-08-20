@@ -62,17 +62,59 @@ type ComparisonConfig struct {
 	FailOnDifferences   bool
 	ExcludePatterns     []string
 
+	// When false, operate in degraded mode if secondary is unavailable: route only to SourceOfTruth and do not reject queries.
+	// When true, enforce that secondary must be healthy; otherwise reject queries on this connection.
+	RequireSecondary bool
+	// If true, and the secondary fails startup due to missing database (SQLSTATE 3D000), allow degraded mode for this connection
+	// even when RequireSecondary=true. Default true to improve operability during bootstrap.
+	FailOpenOnMissingDatabase bool
+
+	// Sorting and special divergence handling
+	SortBeforeCompare                    bool // When true, sort DataRow results lexicographically before comparing
+	SyntaxErrorDivergenceFailAndRollback bool // When true, on syntax-error divergence fail the client transaction (no report)
+	SyntaxErrorDivergenceReport          bool // When true, still report syntax-error divergence (default false)
+
+	// Catalog-difference suppression
+	IgnoreCatalogDifferences  bool     // When true, do not report/fail differences for catalog queries
+	CatalogDifferencePatterns []string // Regex patterns to detect catalog queries
+
 	// Slow query reporting
 	ReportSlowQueries bool
 	SlowQueryRatio    float64
 	FailOnSlowQueries bool
 
-	// EXPLAIN configuration
+	// Extended protocol dual-execution control
+	DualExtendedProtocol bool
+
+	// EXPLAIN configuration (legacy string form)
 	ExplainSelect string // e.g., "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)"
 	ExplainOther  string // e.g., "EXPLAIN (FORMAT TEXT)"
+	// EXPLAIN configuration (structured form for tests)
+	ExplainOptions ExplainAnalyzeOptions
 
 	// Compiled exclude patterns
 	excludePatterns []*regexp.Regexp
+	// Compiled catalog patterns
+	catalogPatterns []*regexp.Regexp
+}
+
+// ExplainAnalyzeOptions groups per-DB EXPLAIN options
+type ExplainAnalyzeOptions struct {
+	PostgreSQL ExplainOptions
+	YugabyteDB ExplainOptions
+}
+
+// ExplainOptions represents tunable EXPLAIN flags
+type ExplainOptions struct {
+	Analyze bool
+	Buffers bool
+	Costs   bool
+	Timing  bool
+	Summary bool
+	Format  string // TEXT or JSON
+	// YB-specific flags (ignored by PG)
+	Dist  bool
+	Debug bool
 }
 
 // FeaturesConfig contains feature compatibility mappings
@@ -254,11 +296,38 @@ func LoadConfig(filename string) (*Config, error) {
 	cfg.Comparison.LogComparisons = conf.GetBoolean("comparison.log-comparisons")
 	cfg.Comparison.LogDifferencesOnly = conf.GetBoolean("comparison.log-differences-only")
 	cfg.Comparison.FailOnDifferences = conf.GetBoolean("comparison.fail-on-differences")
+	// Sorting and special divergence handling
+	cfg.Comparison.SortBeforeCompare = conf.GetBoolean("comparison.sort-before-compare")
+	// Defaults for syntax error divergence handling: fail transaction (true) and do not report (false)
+	cfg.Comparison.SyntaxErrorDivergenceFailAndRollback = true
+	if conf.Get("comparison.syntax-error-divergence-fail-and-rollback") != nil {
+		cfg.Comparison.SyntaxErrorDivergenceFailAndRollback = conf.GetBoolean("comparison.syntax-error-divergence-fail-and-rollback")
+	}
+	cfg.Comparison.SyntaxErrorDivergenceReport = false
+	if conf.Get("comparison.syntax-error-divergence-report") != nil {
+		cfg.Comparison.SyntaxErrorDivergenceReport = conf.GetBoolean("comparison.syntax-error-divergence-report")
+	}
+	// Require secondary can be absent; default to true (strict mode: reject when secondary is unavailable)
+	cfg.Comparison.RequireSecondary = true
+	if conf.Get("comparison.require-secondary") != nil {
+		cfg.Comparison.RequireSecondary = conf.GetBoolean("comparison.require-secondary")
+	}
+	// Fail-open on missing database (3D000) default: true for better bootstrap UX
+	cfg.Comparison.FailOpenOnMissingDatabase = true
+	if conf.Get("comparison.fail-open-on-missing-database") != nil {
+		cfg.Comparison.FailOpenOnMissingDatabase = conf.GetBoolean("comparison.fail-open-on-missing-database")
+	}
 
 	// Slow query config
 	cfg.Comparison.ReportSlowQueries = conf.GetBoolean("comparison.report-slow-queries")
 	cfg.Comparison.SlowQueryRatio = conf.GetFloat64("comparison.slow-query-ratio")
 	cfg.Comparison.FailOnSlowQueries = conf.GetBoolean("comparison.fail-on-slow-queries")
+
+	// Extended protocol dual execution (default: enabled)
+	cfg.Comparison.DualExtendedProtocol = true
+	if conf.Get("comparison.dual-extended-protocol") != nil {
+		cfg.Comparison.DualExtendedProtocol = conf.GetBoolean("comparison.dual-extended-protocol")
+	}
 
 	// EXPLAIN configuration (tunable)
 	cfg.Comparison.ExplainSelect = conf.GetString("comparison.explain.select")
@@ -268,6 +337,25 @@ func LoadConfig(filename string) (*Config, error) {
 	cfg.Comparison.ExplainOther = conf.GetString("comparison.explain.other")
 	if cfg.Comparison.ExplainOther == "" {
 		cfg.Comparison.ExplainOther = "EXPLAIN (FORMAT TEXT)"
+	}
+	// Structured EXPLAIN defaults for tests and future use
+	cfg.Comparison.ExplainOptions.PostgreSQL = ExplainOptions{
+		Analyze: true,
+		Buffers: true,
+		Costs:   true,
+		Timing:  true,
+		Summary: false,
+		Format:  "TEXT",
+	}
+	cfg.Comparison.ExplainOptions.YugabyteDB = ExplainOptions{
+		Analyze: true,
+		Buffers: true,
+		Costs:   true,
+		Timing:  true,
+		Summary: false,
+		Format:  "TEXT",
+		Dist:    true,
+		Debug:   false,
 	}
 
 	// Load and compile exclude patterns
@@ -282,6 +370,31 @@ func LoadConfig(filename string) (*Config, error) {
 	// Compile exclude patterns
 	if err := compileExcludePatterns(&cfg.Comparison); err != nil {
 		return nil, fmt.Errorf("failed to compile exclude patterns: %w", err)
+	}
+
+	// Load catalog-difference suppression config
+	cfg.Comparison.IgnoreCatalogDifferences = true
+	if conf.Get("comparison.ignore-catalog-differences") != nil {
+		cfg.Comparison.IgnoreCatalogDifferences = conf.GetBoolean("comparison.ignore-catalog-differences")
+	}
+	defaultCatalogPatterns := []string{
+		"(?i)(^|\\W)(pg_catalog\\.)",
+		"(?i)(^|\\W)(information_schema\\.)",
+		"(?i)\\bpg_[a-z0-9_]+\\b",
+	}
+	catalogPatterns := conf.GetStringSlice("comparison.catalog-difference-patterns")
+	if len(catalogPatterns) == 0 {
+		catalogPatterns = defaultCatalogPatterns
+	}
+	cfg.Comparison.CatalogDifferencePatterns = make([]string, len(catalogPatterns))
+	for i, pattern := range catalogPatterns {
+		cleaned := strings.Trim(pattern, "\"")
+		cleaned = strings.ReplaceAll(cleaned, "\\\\", "\\")
+		cfg.Comparison.CatalogDifferencePatterns[i] = cleaned
+	}
+	// Compile catalog patterns
+	if err := compileCatalogPatterns(&cfg.Comparison); err != nil {
+		return nil, fmt.Errorf("failed to compile catalog difference patterns: %w", err)
 	}
 
 	// Load error mappings
@@ -355,6 +468,32 @@ func compileExcludePatterns(comparison *ComparisonConfig) error {
 	}
 
 	return nil
+}
+
+// compileCatalogPatterns compiles catalog difference suppression patterns
+func compileCatalogPatterns(comparison *ComparisonConfig) error {
+	for _, pattern := range comparison.CatalogDifferencePatterns {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return fmt.Errorf("invalid catalog difference pattern %s: %w", pattern, err)
+		}
+		comparison.catalogPatterns = append(comparison.catalogPatterns, re)
+	}
+	return nil
+}
+
+// IsCatalogQuery checks if the given query hits pg_catalog, information_schema or pg_* relations
+func (c *Config) IsCatalogQuery(query string) bool {
+	if query == "" {
+		return false
+	}
+	// Evaluate against compiled patterns
+	for _, re := range c.Comparison.catalogPatterns {
+		if re.MatchString(query) {
+			return true
+		}
+	}
+	return false
 }
 
 // loadErrorMappings loads error mapping configuration

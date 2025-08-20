@@ -48,14 +48,27 @@ $EDITOR my-twinkly.conf
 ```
 Important settings include PostgreSQL/YugabyteDB endpoints and comparison policies (source-of-truth, exclude patterns, slow query thresholds). See comments inside `config/twinkly.conf`.
 
+Resolution order for configuration file:
+1. -config path (or -c)
+2. $TWINKLY_CONFIG environment variable
+3. ./config/twinkly.conf
+4. <binary_dir>/config/twinkly.conf
+
 ### 3) Run the proxy
 ```bash
 # from repository root or your GOPATH/pkg/mod checkout
 ./twinkly -config my-twinkly.conf
+# or shorthand
+./twinkly -c my-twinkly.conf
+# or using environment variable
+TWINKLY_CONFIG=my-twinkly.conf ./twinkly
 # or if built with `go build` as main package
 go run . -config my-twinkly.conf
 ```
+The proxy logs which config file it uses. If it cannot find a config, it prints the locations it tried and a tip on how to pass one.
 The proxy listens on the configured port (default from config). Point your SQL client or test suite to the proxy address.
+
+Note: At runtime, the proxy enforces YugabyteDB as the source of truth for client-visible results. If your config sets a different value, it will be overridden with a warning.
 
 ## Usage Notes
 - By default, YugabyteDB is enforced as the source of truth for client-visible results.

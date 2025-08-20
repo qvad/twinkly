@@ -42,7 +42,7 @@ func TestProxyMessage_SyncDrainsUntilReady(t *testing.T) {
 
 	// Send a Sync message through the proxy
 	syncMsg := &PGMessage{Type: msgTypeSync, Data: []byte{0, 0, 0, 0}}
-	proxy.proxyMessage(syncMsg, clientWriter, dbWriter, dbReader)
+	proxy.proxyMessage(syncMsg, clientWriter, dbWriter, dbReader, "DB")
 
 	// Verify backend received the Sync (first byte should be 'S')
 	got := dbIncoming.Bytes()
@@ -84,7 +84,7 @@ func TestProxyMessage_FlushDoesNotRead(t *testing.T) {
 	dbWriter := NewPGProtocolWriter(&dbIncoming)
 
 	flush := &PGMessage{Type: msgTypeFlush, Data: []byte{0, 0, 0, 0}}
-	proxy.proxyMessage(flush, clientWriter, dbWriter, dbReader)
+	proxy.proxyMessage(flush, clientWriter, dbWriter, dbReader, "DB")
 
 	// Ensure no reads happened from dbReader
 	if cr.reads != 0 {

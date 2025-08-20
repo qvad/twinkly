@@ -147,14 +147,14 @@ func TestSecurityValidation(t *testing.T) {
 
 // TestResultValidator tests result validation functionality
 func TestResultValidator(t *testing.T) {
-	validator := NewResultValidator(true)
+	validator := NewResultValidator(true, false)
 
 	tests := []struct {
-		name           string
-		pgResults      []*PGMessage
-		ybResults      []*PGMessage
-		expectFail     bool
-		expectError    bool
+		name        string
+		pgResults   []*PGMessage
+		ybResults   []*PGMessage
+		expectFail  bool
+		expectError bool
 	}{
 		{
 			name: "identical results",
@@ -207,14 +207,14 @@ func TestResultValidator(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result, err := validator.ValidateResults(tt.pgResults, tt.ybResults)
-			
+
 			if tt.expectError && err == nil {
 				t.Error("Expected error but got none")
 			}
 			if !tt.expectError && err != nil {
 				t.Errorf("Expected no error but got: %v", err)
 			}
-			
+
 			if result != nil {
 				if tt.expectFail && !result.ShouldFail {
 					t.Error("Expected validation to fail but it passed")
@@ -258,7 +258,7 @@ func TestPGProtocol(t *testing.T) {
 				Type: msgTypeQuery,
 				Data: tt.data,
 			}
-			
+
 			// Test query parsing
 			query, err := ParseQuery(msg)
 			if tt.expectError && err == nil {
@@ -267,7 +267,7 @@ func TestPGProtocol(t *testing.T) {
 			if !tt.expectError && err != nil {
 				t.Errorf("Expected no error but got: %v", err)
 			}
-			
+
 			if !tt.expectError && query != strings.TrimRight(string(tt.data), "\x00") {
 				t.Errorf("Expected query %q but got %q", string(tt.data), query)
 			}
@@ -278,14 +278,14 @@ func TestPGProtocol(t *testing.T) {
 	t.Run("message type checking", func(t *testing.T) {
 		queryMsg := &PGMessage{Type: msgTypeQuery, Data: []byte("SELECT 1")}
 		terminateMsg := &PGMessage{Type: msgTypeTerminate, Data: []byte{}}
-		
+
 		if !IsQueryMessage(queryMsg) {
 			t.Error("Expected query message to be identified as query")
 		}
 		if IsQueryMessage(terminateMsg) {
 			t.Error("Expected terminate message to not be identified as query")
 		}
-		
+
 		if !IsTerminateMessage(terminateMsg) {
 			t.Error("Expected terminate message to be identified as terminate")
 		}
@@ -300,10 +300,10 @@ func TestConstraintDetector(t *testing.T) {
 	detector := NewConstraintDivergenceDetector()
 
 	tests := []struct {
-		name              string
-		pgResult          *QueryExecutionResult
-		ybResult          *QueryExecutionResult
-		expectDivergence  bool
+		name             string
+		pgResult         *QueryExecutionResult
+		ybResult         *QueryExecutionResult
+		expectDivergence bool
 	}{
 		{
 			name: "both succeed",
@@ -349,7 +349,7 @@ func TestConstraintDetector(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			divergence := detector.DetectDivergence("INSERT INTO test VALUES (1)", tt.pgResult, tt.ybResult)
-			
+
 			if tt.expectDivergence && divergence == nil {
 				t.Error("Expected divergence but got none")
 			}
@@ -422,10 +422,10 @@ func TestSlowQueryAnalyzer(t *testing.T) {
 // TestErrorHandler tests error handling functionality
 func TestErrorHandler(t *testing.T) {
 	tests := []struct {
-		name        string
-		errorCode   string
-		fromDB      string
-		expectMap   bool
+		name      string
+		errorCode string
+		fromDB    string
+		expectMap bool
 	}{
 		{
 			name:      "unmapped error",
@@ -481,10 +481,10 @@ func TestConfigQueryRouting(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		query          string
-		expectPG       bool
-		expectYB       bool
+		name     string
+		query    string
+		expectPG bool
+		expectYB bool
 	}{
 		{
 			name:     "postgres catalog query",
@@ -549,9 +549,9 @@ func TestComparisonConfig(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		query          string
-		expectCompare  bool
+		name          string
+		query         string
+		expectCompare bool
 	}{
 		{
 			name:          "regular query",
@@ -625,10 +625,20 @@ func TestUtilityFunctions(t *testing.T) {
 		{"INSERT INTO pg_user VALUES (1)", true}, // Contains pg_
 	}
 
+	// Build a Config with default catalog patterns and compile them
+	cfg := &Config{}
+	cfg.Comparison.CatalogDifferencePatterns = []string{
+		"(?i)(^|\\W)(pg_catalog\\.)",
+		"(?i)(^|\\W)(information_schema\\.)",
+		"(?i)\\bpg_[a-z0-9_]+\\b",
+	}
+	if err := compileCatalogPatterns(&cfg.Comparison); err != nil {
+		t.Fatalf("failed to compile catalog patterns: %v", err)
+	}
 	for _, tt := range tests {
-		result := isCatalogQuery(tt.query)
+		result := cfg.IsCatalogQuery(tt.query)
 		if result != tt.expected {
-			t.Errorf("isCatalogQuery(%q) = %v, expected %v", tt.query, result, tt.expected)
+			t.Errorf("IsCatalogQuery(%q) = %v, expected %v", tt.query, result, tt.expected)
 		}
 	}
 }
@@ -725,20 +735,20 @@ func TestProxyCreation(t *testing.T) {
 		Proxy: ProxyConfig{
 			ListenPort: 5431,
 			PostgreSQL: DatabaseConfig{
-				Host: "localhost",
-				Port: 5432,
-				User: "postgres",
+				Host:     "localhost",
+				Port:     5432,
+				User:     "postgres",
 				Database: "test",
 			},
 			YugabyteDB: DatabaseConfig{
-				Host: "localhost",
-				Port: 5433,
-				User: "postgres",
+				Host:     "localhost",
+				Port:     5433,
+				User:     "postgres",
 				Database: "test",
 			},
 		},
 		Comparison: ComparisonConfig{
-			Enabled: true,
+			Enabled:       true,
 			SourceOfTruth: "yugabytedb",
 		},
 	}
@@ -782,7 +792,7 @@ func TestConfigSecurity(t *testing.T) {
 				Port: 5432,
 			},
 			YugabyteDB: DatabaseConfig{
-				Host: "localhost", 
+				Host: "localhost",
 				Port: 5433,
 			},
 		},
@@ -834,15 +844,15 @@ func TestDualDatabaseResolver(t *testing.T) {
 	config := &Config{
 		Proxy: ProxyConfig{
 			PostgreSQL: DatabaseConfig{
-				Host: "localhost",
-				Port: 5432,
-				User: "postgres",
+				Host:     "localhost",
+				Port:     5432,
+				User:     "postgres",
 				Database: "test",
 			},
 			YugabyteDB: DatabaseConfig{
-				Host: "localhost",
-				Port: 5433,
-				User: "postgres", 
+				Host:     "localhost",
+				Port:     5433,
+				User:     "postgres",
 				Database: "test",
 			},
 		},
@@ -930,7 +940,7 @@ func TestConfigAddOrderBy(t *testing.T) {
 			result := config.AddOrderByToQuery(tt.query)
 			hasOrderBy := strings.Contains(strings.ToUpper(result), "ORDER BY")
 			originalHasOrderBy := strings.Contains(strings.ToUpper(tt.query), "ORDER BY")
-			
+
 			if tt.expected {
 				if !hasOrderBy {
 					t.Errorf("Expected ORDER BY to be added to query: %s", tt.query)
@@ -1000,19 +1010,19 @@ func TestDatabaseResult(t *testing.T) {
 // TestConstraintAnalysis tests constraint error analysis
 func TestConstraintAnalysis(t *testing.T) {
 	detector := NewConstraintDivergenceDetector()
-	
+
 	// Test constraint error analysis
 	err := errors.New("duplicate key value violates unique constraint")
 	constraintErr := detector.AnalyzeConstraintError(err)
-	
+
 	if constraintErr == nil {
 		t.Error("Expected constraint error to be detected")
 	}
-	
+
 	// Test non-constraint error
 	err = errors.New("connection refused")
 	constraintErr = detector.AnalyzeConstraintError(err)
-	
+
 	if constraintErr == nil {
 		t.Error("Expected constraint error struct to be returned")
 	} else if constraintErr.Type != UnknownConstraint {
@@ -1135,18 +1145,18 @@ func TestLoadConfig(t *testing.T) {
 // TestGetDetectedDivergences tests divergence getter methods
 func TestGetDetectedDivergences(t *testing.T) {
 	detector := NewConstraintDivergenceDetector()
-	
+
 	// Initially should be empty
 	divergences := detector.GetDetectedDivergences()
 	if len(divergences) != 0 {
 		t.Errorf("Expected 0 divergences initially, got %d", len(divergences))
 	}
-	
+
 	count := detector.GetCriticalDivergenceCount()
 	if count != 0 {
 		t.Errorf("Expected 0 critical divergences initially, got %d", count)
 	}
-	
+
 	// Add a divergence by calling DetectDivergence
 	pgResult := &QueryExecutionResult{
 		Success:      true,
@@ -1157,18 +1167,18 @@ func TestGetDetectedDivergences(t *testing.T) {
 		Error:        errors.New("constraint violation"),
 		DatabaseName: "YugabyteDB",
 	}
-	
+
 	divergence := detector.DetectDivergence("INSERT INTO test VALUES (1)", pgResult, ybResult)
 	if divergence == nil {
 		t.Error("Expected divergence to be detected")
 	}
-	
+
 	// Check that divergences are stored
 	divergences = detector.GetDetectedDivergences()
 	if len(divergences) != 1 {
 		t.Errorf("Expected 1 divergence after detection, got %d", len(divergences))
 	}
-	
+
 	count = detector.GetCriticalDivergenceCount()
 	if count != 1 {
 		t.Errorf("Expected 1 critical divergence after detection, got %d", count)
@@ -1178,7 +1188,7 @@ func TestGetDetectedDivergences(t *testing.T) {
 // TestConstraintTypeToString tests constraint type string conversion
 func TestConstraintTypeToString(t *testing.T) {
 	detector := NewConstraintDivergenceDetector()
-	
+
 	tests := []struct {
 		constraintType ConstraintViolationType
 		expected       string
@@ -1190,7 +1200,7 @@ func TestConstraintTypeToString(t *testing.T) {
 		{PrimaryKeyViolation, "PRIMARY_KEY_VIOLATION"},
 		{UnknownConstraint, "UNKNOWN_CONSTRAINT"},
 	}
-	
+
 	for _, tt := range tests {
 		result := detector.constraintTypeToString(tt.constraintType)
 		if result != tt.expected {
@@ -1206,7 +1216,7 @@ func TestPGProtocolReadWrite(t *testing.T) {
 	if errorMsg == nil {
 		t.Fatal("Expected error message to be created")
 	}
-	
+
 	// Test query message creation
 	queryMsg := CreateQueryMessage("SELECT 1")
 	if queryMsg == nil {
@@ -1226,12 +1236,12 @@ func TestExtractDataRows(t *testing.T) {
 		{Type: msgTypeCommandComplete, Data: []byte("SELECT 2")},
 		{Type: msgTypeReadyForQuery, Data: []byte("I")},
 	}
-	
+
 	dataRows := extractDataRows(messages)
 	if len(dataRows) != 2 {
 		t.Errorf("Expected 2 data rows, got %d", len(dataRows))
 	}
-	
+
 	for _, row := range dataRows {
 		if row.Type != msgTypeDataRow {
 			t.Errorf("Expected data row type 'D', got %c", row.Type)
@@ -1246,10 +1256,10 @@ func TestProxyReporter(t *testing.T) {
 			FailOnDifferences: true,
 		},
 	}
-	
+
 	reporter := NewInconsistencyReporter()
 	proxy := NewDualExecutionProxyWithReporter(config, reporter)
-	
+
 	retrievedReporter := proxy.GetReporter()
 	if retrievedReporter != reporter {
 		t.Error("Expected proxy to return the same reporter")
@@ -1263,7 +1273,7 @@ func TestAdditionalSecurityValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to compile patterns: %v", err)
 	}
-	
+
 	// Test rate limiter creation
 	rateLimiter := NewRateLimiter(10, 60)
 	if rateLimiter == nil {
@@ -1278,18 +1288,18 @@ func TestAdditionalConfig(t *testing.T) {
 			ForceOrderByCompare: false,
 		},
 	}
-	
+
 	// Test AddOrderByToQuery when disabled
 	query := "SELECT * FROM users"
 	result := config.AddOrderByToQuery(query)
 	if result != query {
 		t.Error("Expected query to remain unchanged when ForceOrderByCompare is false")
 	}
-	
+
 	// Test findOrderColumn with different scenarios
 	config.Comparison.ForceOrderByCompare = true
 	config.Comparison.DefaultOrderColumns = []string{"*"}
-	
+
 	result = config.AddOrderByToQuery("SELECT * FROM users")
 	if !strings.Contains(result, "ORDER BY") {
 		t.Error("Expected ORDER BY to be added when using * column")
@@ -1299,19 +1309,19 @@ func TestAdditionalConfig(t *testing.T) {
 // TestInconsistencyReporting tests additional reporter functionality
 func TestInconsistencyReporting(t *testing.T) {
 	reporter := NewInconsistencyReporter()
-	
+
 	// Test impact assessment
 	impact := reporter.assessImpact(ErrorDivergence, "CRITICAL")
 	if impact == "" {
 		t.Error("Expected impact assessment to return non-empty string")
 	}
-	
+
 	// Test recommendation generation
 	recommendation := reporter.getRecommendation(RowCountMismatch)
 	if recommendation == "" {
 		t.Error("Expected recommendation to return non-empty string")
 	}
-	
+
 	// Test difference handling - we can't test formatDifferences directly as it's private
 	// but we can test that the summary generation works
 	summary := reporter.GenerateSummaryReport()

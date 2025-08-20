@@ -28,6 +28,8 @@ type DualExecutionProxy struct {
 	secondaryDisabledLogged bool   // ensures we log the DISABLED warning only once per connection
 	secondaryBlocked        bool   // once set due to inconsistency, stop sending further operations to secondary for this connection
 	secondaryReason         string // last known reason why secondary is disabled/not ready
+	lastParsedSQL           string // last SQL seen in extended protocol Parse for this connection
+	requireSecondary        bool   // per-connection enforcement; initialized from config and may be relaxed on specific startup errors
 }
 
 // NewDualExecutionProxy creates a new dual execution proxy
@@ -44,7 +46,8 @@ func NewDualExecutionProxy(config *Config) *DualExecutionProxy {
 		security:           NewSecurityConfig(),
 		constraintDetector: NewConstraintDivergenceDetector(),
 		reporter:           rep,
-		resultValidator:    NewResultValidator(config.Comparison.FailOnDifferences),
+		resultValidator:    NewResultValidator(config.Comparison.FailOnDifferences, config.Comparison.SortBeforeCompare),
+		requireSecondary:   config.Comparison.RequireSecondary,
 	}
 }
 
@@ -61,7 +64,8 @@ func NewDualExecutionProxyWithReporter(config *Config, reporter *InconsistencyRe
 		security:           NewSecurityConfig(),
 		constraintDetector: NewConstraintDivergenceDetector(),
 		reporter:           reporter,
-		resultValidator:    NewResultValidator(config.Comparison.FailOnDifferences),
+		resultValidator:    NewResultValidator(config.Comparison.FailOnDifferences, config.Comparison.SortBeforeCompare),
+		requireSecondary:   config.Comparison.RequireSecondary,
 	}
 }
 
@@ -90,7 +94,11 @@ func (p *DualExecutionProxy) logSecondaryDisabled(reason string) {
 	if strings.TrimSpace(useReason) == "" {
 		useReason = reason
 	}
-	log.Printf("⚠ %s secondary DISABLED for this connection: %s. Dual comparison is REQUIRED; queries will be rejected until secondary is healthy.", secondaryName, useReason)
+	if p.requireSecondary {
+		log.Printf("⚠ %s secondary DISABLED for this connection: %s. Dual comparison is REQUIRED; queries will be rejected until secondary is healthy.", secondaryName, useReason)
+	} else {
+		log.Printf("⚠ %s secondary DISABLED for this connection: %s. Operating in DEGRADED MODE: routing only to %s; comparisons disabled for this connection.", secondaryName, useReason, strings.Title(p.config.Comparison.SourceOfTruth))
+	}
 }
 
 func (p *DualExecutionProxy) HandleConnection(clientConn net.Conn) {
@@ -271,20 +279,32 @@ func (p *DualExecutionProxy) HandleConnection(clientConn net.Conn) {
 						}
 						continue
 					}
-					// For all other queries: reject to enforce dual execution policy
-					p.logSecondaryDisabled("secondary not ready for this connection")
-					p.secondaryBlocked = true // block further operations on this connection until reconnect
-					// Return clear SQL error to client and do not route to any backend. Include concrete reason if known.
-					reason := p.secondaryReason
-					if reason == "" {
-						reason = "unknown reason"
+					// For all other queries
+					if p.requireSecondary {
+						// Reject to enforce dual execution policy
+						p.logSecondaryDisabled("secondary not ready for this connection")
+						p.secondaryBlocked = true // block further operations on this connection until reconnect
+						// Return clear SQL error to client and do not route to any backend. Include concrete reason if known.
+						reason := p.secondaryReason
+						if reason == "" {
+							reason = "unknown reason"
+						}
+						errorText := fmt.Sprintf("Dual comparison is required but secondary is not available (%s); query aborted. Please retry after secondary recovers or reconnect.", reason)
+						errorMsg := CreateErrorMessage("ERROR", "XX000", errorText)
+						clientWriter.WriteMessage(errorMsg)
+						readyMsg := &PGMessage{Type: msgTypeReadyForQuery, Data: []byte{'I'}}
+						clientWriter.WriteMessage(readyMsg)
+						continue
+					} else {
+						// Degraded mode: route to source of truth only, no comparison
+						p.logSecondaryDisabled("secondary not ready for this connection")
+						if p.config.Comparison.SourceOfTruth == "yugabytedb" {
+							p.proxySingleQuery(msg, clientWriter, ybWriter, ybReader, "YugabyteDB")
+						} else {
+							p.proxySingleQuery(msg, clientWriter, pgWriter, pgReader, "PostgreSQL")
+						}
+						continue
 					}
-					errorText := fmt.Sprintf("Dual comparison is required but secondary is not available (%s); query aborted. Please retry after secondary recovers or reconnect.", reason)
-					errorMsg := CreateErrorMessage("ERROR", "XX000", errorText)
-					clientWriter.WriteMessage(errorMsg)
-					readyMsg := &PGMessage{Type: msgTypeReadyForQuery, Data: []byte{'I'}}
-					clientWriter.WriteMessage(readyMsg)
-					continue
 				}
 			} else {
 				// Default routing based on source of truth
@@ -295,11 +315,17 @@ func (p *DualExecutionProxy) HandleConnection(clientConn net.Conn) {
 				}
 			}
 		} else {
-			// For non-query messages, forward to source of truth
-			if p.config.Comparison.SourceOfTruth == "yugabytedb" {
-				p.proxyMessage(msg, clientWriter, ybWriter, ybReader)
+			// For non-query (extended protocol) messages
+			if p.config.Comparison.Enabled && p.secondaryReady && p.config.Comparison.DualExtendedProtocol {
+				// Mirror to both backends; only read/drain on Sync
+				p.proxyExtendedDualMessage(msg, clientWriter, pgWriter, pgReader, ybWriter, ybReader)
 			} else {
-				p.proxyMessage(msg, clientWriter, pgWriter, pgReader)
+				// Forward to source of truth only
+				if p.config.Comparison.SourceOfTruth == "yugabytedb" {
+					p.proxyMessage(msg, clientWriter, ybWriter, ybReader, "YugabyteDB")
+				} else {
+					p.proxyMessage(msg, clientWriter, pgWriter, pgReader, "PostgreSQL")
+				}
 			}
 		}
 	}
@@ -502,13 +528,26 @@ func (p *DualExecutionProxy) handleStartupPhase(client, pg, yb net.Conn) error {
 	select {
 	case err := <-readyCh:
 		if err != nil {
-			// Non-fatal for startup: establish connection to primary; queries will be rejected until secondary is healthy.
-			// Suppress noisy warnings for benign EOF/transport errors; log as info instead.
+			// Non-fatal for startup: establish connection to primary.
+			// Suppress noisy warnings for benign EOF/transport errors.
 			lower := strings.ToLower(err.Error())
-			if isTransportError(err) && strings.Contains(lower, "eof") {
-				log.Printf("Info: secondary %s not available during startup (EOF). Dual comparison is REQUIRED; queries will be rejected for this connection until secondary is healthy.", secondaryName)
+			// Special case: missing database on secondary (SQLSTATE 3D000). Optionally fail-open for this connection.
+			if p.config.Comparison.FailOpenOnMissingDatabase && (strings.Contains(lower, "3d000") || strings.Contains(lower, "database \"") && strings.Contains(lower, "does not exist") || strings.Contains(lower, "database does not exist")) {
+				p.requireSecondary = false
+				log.Printf("Warning: secondary %s missing database during startup (%v). Operating in DEGRADED MODE for this connection: comparisons disabled until secondary is healthy.", secondaryName, err)
+			}
+			if p.requireSecondary {
+				if isTransportError(err) && strings.Contains(lower, "eof") {
+					log.Printf("Info: secondary %s not available during startup (EOF). Dual comparison is REQUIRED; queries will be rejected for this connection until secondary is healthy.", secondaryName)
+				} else {
+					log.Printf("Warning: secondary %s failed during startup (%v). Startup will continue, but dual comparison is REQUIRED; queries will be rejected for this connection until secondary is healthy.", secondaryName, err)
+				}
 			} else {
-				log.Printf("Warning: secondary %s failed during startup (%v). Startup will continue, but dual comparison is REQUIRED; queries will be rejected for this connection until secondary is healthy.", secondaryName, err)
+				if isTransportError(err) && strings.Contains(lower, "eof") {
+					log.Printf("Info: secondary %s not available during startup (EOF). Operating in DEGRADED MODE: comparisons disabled for this connection.", secondaryName)
+				} else {
+					log.Printf("Warning: secondary %s failed during startup (%v). Operating in DEGRADED MODE: comparisons disabled for this connection.", secondaryName, err)
+				}
 			}
 			p.secondaryReady = false
 			p.logSecondaryDisabled("startup failed: " + err.Error())
@@ -516,8 +555,11 @@ func (p *DualExecutionProxy) handleStartupPhase(client, pg, yb net.Conn) error {
 			p.secondaryReady = true
 		}
 	case <-time.After(10 * time.Second):
-		// Startup continues, but dual comparison is required; queries will be rejected until secondary is healthy.
-		log.Printf("Warning: secondary %s did not complete startup within timeout. Startup will continue, but dual comparison is REQUIRED; queries will be rejected for this connection until secondary is healthy.", secondaryName)
+		if p.requireSecondary {
+			log.Printf("Warning: secondary %s did not complete startup within timeout. Startup will continue, but dual comparison is REQUIRED; queries will be rejected for this connection until secondary is healthy.", secondaryName)
+		} else {
+			log.Printf("Warning: secondary %s did not complete startup within timeout. Operating in DEGRADED MODE: comparisons disabled for this connection.", secondaryName)
+		}
 		p.secondaryReady = false
 		p.logSecondaryDisabled("startup timeout")
 	}
@@ -530,7 +572,12 @@ func (p *DualExecutionProxy) executeDualQuery(msg *PGMessage, query string, clie
 	pgWriter *PGProtocolWriter, pgReader *PGProtocolReader,
 	ybWriter *PGProtocolWriter, ybReader *PGProtocolReader) error {
 
-	log.Printf("Executing dual query: %s", query)
+	// High-level query log
+	if p.config != nil && p.config.Debug.LogAllQueries {
+		log.Printf("QUERY: %s", query)
+	} else {
+		log.Printf("Executing dual query: %s", query)
+	}
 
 	// Send query to both databases
 	if err := pgWriter.WriteMessage(msg); err != nil {
@@ -569,6 +616,20 @@ func (p *DualExecutionProxy) executeDualQuery(msg *PGMessage, query string, clie
 	}()
 
 	wg.Wait()
+
+	// Per-backend outcome logging
+	if p.config != nil && p.config.Debug.LogAllQueries {
+		if pgErr != nil {
+			log.Printf("PG - error: %v", pgErr)
+		} else {
+			log.Printf("PG - ok")
+		}
+		if ybErr != nil {
+			log.Printf("YB - error: %v", ybErr)
+		} else {
+			log.Printf("YB - ok")
+		}
+	}
 
 	// CRITICAL: Analyze for constraint violation divergence
 	pgResult := &QueryExecutionResult{
@@ -659,6 +720,53 @@ func (p *DualExecutionProxy) executeDualQuery(msg *PGMessage, query string, clie
 
 		// Report error divergence if one succeeded and one failed
 		if (pgErr == nil) != (ybErr == nil) {
+			// Syntax error divergence special case
+			if (pgErr != nil && isSyntaxError(pgErr) && ybErr == nil) || (ybErr != nil && isSyntaxError(ybErr) && pgErr == nil) {
+				// Optionally fail transaction (no report)
+				if p.config.Comparison.SyntaxErrorDivergenceFailAndRollback {
+					var errText string
+					if pgErr != nil {
+						errText = pgErr.Error()
+					} else {
+						errText = ybErr.Error()
+					}
+					errMsg := CreateErrorMessage("ERROR", "42601", "Syntax error detected on one backend; aborting transaction to avoid undefined behavior: "+errText)
+					clientWriter.WriteMessage(errMsg)
+					status := byte('I')
+					if p.inTransaction {
+						status = 'E'
+					}
+					clientWriter.WriteMessage(&PGMessage{Type: msgTypeReadyForQuery, Data: []byte{status}})
+					if p.config.Comparison.SyntaxErrorDivergenceReport {
+						pgSummary := ResultSummary{Success: pgErr == nil}
+						if pgErr != nil {
+							pgSummary.Error = pgErr.Error()
+						}
+						ybSummary := ResultSummary{Success: ybErr == nil}
+						if ybErr != nil {
+							ybSummary.Error = ybErr.Error()
+						}
+						differences := []string{"One database succeeded while the other failed (syntax error)"}
+						p.reporter.ReportInconsistency(ErrorDivergence, "LOW", query, pgSummary, ybSummary, differences)
+					}
+					return fmt.Errorf("syntax error divergence")
+				}
+				// Not failing: optionally report, else proceed to forward successful DB
+				if p.config.Comparison.SyntaxErrorDivergenceReport {
+					pgSummary := ResultSummary{Success: pgErr == nil}
+					if pgErr != nil {
+						pgSummary.Error = pgErr.Error()
+					}
+					ybSummary := ResultSummary{Success: ybErr == nil}
+					if ybErr != nil {
+						ybSummary.Error = ybErr.Error()
+					}
+					differences := []string{"One database succeeded while the other failed (syntax error)"}
+					p.reporter.ReportInconsistency(ErrorDivergence, "LOW", query, pgSummary, ybSummary, differences)
+				}
+				// Fall through to forwarding
+			}
+
 			differences := []string{
 				fmt.Sprintf("PostgreSQL: %v", pgErr),
 				fmt.Sprintf("YugabyteDB: %v", ybErr),
@@ -679,16 +787,20 @@ func (p *DualExecutionProxy) executeDualQuery(msg *PGMessage, query string, clie
 				ybSummary.Error = ybErr.Error()
 			}
 
-			p.reporter.ReportInconsistency(
-				ErrorDivergence,
-				"CRITICAL",
-				query,
-				pgSummary,
-				ybSummary,
-				differences,
-			)
+			// Optionally suppress divergence reporting for catalog queries
+			ignoreCatalog := p.config.Comparison.IgnoreCatalogDifferences && p.config.IsCatalogQuery(query)
+			if !ignoreCatalog {
+				p.reporter.ReportInconsistency(
+					ErrorDivergence,
+					"CRITICAL",
+					query,
+					pgSummary,
+					ybSummary,
+					differences,
+				)
+			}
 			// Prevent client hang: either fail fast or forward the successful DB
-			if p.config.Comparison.FailOnDifferences {
+			if p.config.Comparison.FailOnDifferences && !ignoreCatalog {
 				// Block secondary for this connection due to inconsistency
 				p.secondaryBlocked = true
 				p.secondaryReady = false
@@ -739,39 +851,42 @@ func (p *DualExecutionProxy) executeDualQuery(msg *PGMessage, query string, clie
 					log.Printf("WARNING: Row count mismatch for query: %s", query)
 
 					// Report the row count mismatch
-					differences := []string{
-						fmt.Sprintf("PostgreSQL returned %d rows", len(pgDataRows)),
-						fmt.Sprintf("YugabyteDB returned %d rows", len(ybDataRows)),
-						fmt.Sprintf("Difference: %d rows", len(pgDataRows)-len(ybDataRows)),
-					}
+					ignoreCatalog := p.config.Comparison.IgnoreCatalogDifferences && p.config.IsCatalogQuery(query)
+					if !ignoreCatalog {
+						differences := []string{
+							fmt.Sprintf("PostgreSQL returned %d rows", len(pgDataRows)),
+							fmt.Sprintf("YugabyteDB returned %d rows", len(ybDataRows)),
+							fmt.Sprintf("Difference: %d rows", len(pgDataRows)-len(ybDataRows)),
+						}
 
-					pgSummary := ResultSummary{
-						Success:  true,
-						RowCount: len(pgDataRows),
-					}
+						pgSummary := ResultSummary{
+							Success:  true,
+							RowCount: len(pgDataRows),
+						}
 
-					ybSummary := ResultSummary{
-						Success:  true,
-						RowCount: len(ybDataRows),
-					}
+						ybSummary := ResultSummary{
+							Success:  true,
+							RowCount: len(ybDataRows),
+						}
 
-					severity := "HIGH"
-					if p.config.Comparison.FailOnDifferences {
-						severity = "CRITICAL"
-					}
+						severity := "HIGH"
+						if p.config.Comparison.FailOnDifferences {
+							severity = "CRITICAL"
+						}
 
-					p.reporter.ReportInconsistency(
-						RowCountMismatch,
-						severity,
-						query,
-						pgSummary,
-						ybSummary,
-						differences,
-					)
+						p.reporter.ReportInconsistency(
+							RowCountMismatch,
+							severity,
+							query,
+							pgSummary,
+							ybSummary,
+							differences,
+						)
 
-					if p.config.Comparison.FailOnDifferences {
-						// Still return results from source of truth, but log the error
-						log.Printf("ERROR: Failing due to result differences (fail-on-differences=true)")
+						if p.config.Comparison.FailOnDifferences {
+							// Still return results from source of truth, but log the error
+							log.Printf("ERROR: Failing due to result differences (fail-on-differences=true)")
+						}
 					}
 				}
 			}
@@ -786,40 +901,49 @@ func (p *DualExecutionProxy) executeDualQuery(msg *PGMessage, query string, clie
 		}
 
 		if validation.ShouldFail {
-			// Report inconsistency and block secondary for this connection
-			severity := "HIGH"
-			if p.config.Comparison.FailOnDifferences {
-				severity = "CRITICAL"
+			ignoreCatalog := p.config.Comparison.IgnoreCatalogDifferences && p.config.IsCatalogQuery(query)
+			if !ignoreCatalog {
+				// Report inconsistency and block secondary for this connection
+				severity := "HIGH"
+				if p.config.Comparison.FailOnDifferences {
+					severity = "CRITICAL"
+				}
+				pgDataRows := extractDataRows(pgResults)
+				ybDataRows := extractDataRows(ybResults)
+				p.reporter.ReportInconsistency(
+					DataValueMismatch,
+					severity,
+					query,
+					ResultSummary{Success: true, RowCount: len(pgDataRows)},
+					ResultSummary{Success: true, RowCount: len(ybDataRows)},
+					validation.Differences,
+				)
+				p.secondaryBlocked = true
+				p.secondaryReady = false
+				p.logSecondaryDisabled("inconsistency detected (result mismatch)")
+				// Return SQL error to user about result differences
+				log.Printf("🚨 CRITICAL: Query results differ - returning error to user")
+				errorMsg := CreateErrorMessage("ERROR", "XX000", validation.ErrorMessage)
+				clientWriter.WriteMessage(errorMsg)
+				readyMsg := &PGMessage{Type: msgTypeReadyForQuery, Data: []byte{'I'}}
+				clientWriter.WriteMessage(readyMsg)
+				return fmt.Errorf("query results differ between databases")
 			}
-			pgDataRows := extractDataRows(pgResults)
-			ybDataRows := extractDataRows(ybResults)
-			p.reporter.ReportInconsistency(
-				DataValueMismatch,
-				severity,
-				query,
-				ResultSummary{Success: true, RowCount: len(pgDataRows)},
-				ResultSummary{Success: true, RowCount: len(ybDataRows)},
-				validation.Differences,
-			)
-			p.secondaryBlocked = true
-			p.secondaryReady = false
-			p.logSecondaryDisabled("inconsistency detected (result mismatch)")
-			// Return SQL error to user about result differences
-			log.Printf("🚨 CRITICAL: Query results differ - returning error to user")
-			errorMsg := CreateErrorMessage("ERROR", "XX000", validation.ErrorMessage)
-			clientWriter.WriteMessage(errorMsg)
-			readyMsg := &PGMessage{Type: msgTypeReadyForQuery, Data: []byte{'I'}}
-			clientWriter.WriteMessage(readyMsg)
-			return fmt.Errorf("query results differ between databases")
 		}
 	}
 
-	// Forward results from source of truth (YugabyteDB)
+	// Forward results from the configured source of truth (note: main.go enforces YugabyteDB at runtime)
 	var resultsToForward []*PGMessage
+	var forwardFrom string
 	if p.config.Comparison.SourceOfTruth == "yugabytedb" {
 		resultsToForward = ybResults
+		forwardFrom = "YB"
 	} else {
 		resultsToForward = pgResults
+		forwardFrom = "PG"
+	}
+	if p.config != nil && p.config.Debug.LogAllQueries {
+		log.Printf("Forwarding results from %s", forwardFrom)
 	}
 
 	// Send results to client
@@ -833,9 +957,13 @@ func (p *DualExecutionProxy) executeDualQuery(msg *PGMessage, query string, clie
 }
 
 // proxySingleQuery forwards a query to a single database
-func (p *DualExecutionProxy) proxySingleQuery(msg *PGMessage, clientWriter *PGProtocolWriter,
-	dbWriter *PGProtocolWriter, dbReader *PGProtocolReader, dbName string) {
-
+func (p *DualExecutionProxy) proxySingleQuery(msg *PGMessage, clientWriter *PGProtocolWriter, dbWriter *PGProtocolWriter, dbReader *PGProtocolReader, dbName string) {
+	// Log query text if available
+	if p.config != nil && p.config.Debug.LogAllQueries {
+		if q, err := ParseQuery(msg); err == nil {
+			log.Printf("QUERY: %s", q)
+		}
+	}
 	log.Printf("Routing query to %s", dbName)
 
 	// Send query
@@ -850,6 +978,7 @@ func (p *DualExecutionProxy) proxySingleQuery(msg *PGMessage, clientWriter *PGPr
 	}
 
 	// Forward all response messages
+	completedOK := false
 	for {
 		response, err := dbReader.ReadMessage()
 		if err != nil {
@@ -869,8 +998,16 @@ func (p *DualExecutionProxy) proxySingleQuery(msg *PGMessage, clientWriter *PGPr
 
 		// Check if this is the end of results
 		if response.Type == msgTypeReadyForQuery {
+			completedOK = true
 			break
 		}
+	}
+	if p.config != nil && p.config.Debug.LogAllQueries {
+		status := "ok"
+		if !completedOK {
+			status = "error"
+		}
+		log.Printf("%s - %s", dbName, status)
 	}
 }
 

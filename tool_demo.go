@@ -9,30 +9,30 @@ import (
 func DemoToolOperation() {
 	fmt.Println("🔧 TWINKLY DUAL DATABASE PROXY DEMO")
 	fmt.Println("===================================")
-	
+
 	// Step 1: Load configuration
 	fmt.Println("\n📋 Step 1: Loading Configuration")
 	config, err := LoadConfig("config/twinkly.conf")
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-	
+
 	fmt.Printf("   ✅ PostgreSQL: %s:%d\n", config.Proxy.PostgreSQL.Host, config.Proxy.PostgreSQL.Port)
 	fmt.Printf("   ✅ YugabyteDB: %s:%d\n", config.Proxy.YugabyteDB.Host, config.Proxy.YugabyteDB.Port)
 	fmt.Printf("   ✅ Source of Truth: %s\n", config.Comparison.SourceOfTruth)
 	fmt.Printf("   ✅ Fail on Differences: %v\n", config.Comparison.FailOnDifferences)
-	
+
 	// Step 2: Create dual proxy
 	fmt.Println("\n🔗 Step 2: Creating Dual Execution Proxy")
 	proxy := NewDualExecutionProxy(config)
 	fmt.Printf("   ✅ Proxy created with dual database support\n")
 	fmt.Printf("   ✅ PostgreSQL Address: %s\n", proxy.pgAddr)
 	fmt.Printf("   ✅ YugabyteDB Address: %s\n", proxy.ybAddr)
-	
+
 	// Step 3: Demonstrate result validation
 	fmt.Println("\n🔍 Step 3: Result Comparison Demo")
-	validator := NewResultValidator(config.Comparison.FailOnDifferences)
-	
+	validator := NewResultValidator(config.Comparison.FailOnDifferences, config.Comparison.SortBeforeCompare)
+
 	// Demo 1: Identical results (should pass)
 	identicalPG := []*PGMessage{
 		{Type: msgTypeRowDescription, Data: []byte("id|name")},
@@ -40,21 +40,21 @@ func DemoToolOperation() {
 		{Type: msgTypeDataRow, Data: []byte("2|Jane")},
 		{Type: msgTypeCommandComplete, Data: []byte("SELECT 2")},
 	}
-	
+
 	identicalYB := []*PGMessage{
 		{Type: msgTypeRowDescription, Data: []byte("id|name")},
 		{Type: msgTypeDataRow, Data: []byte("1|John")},
 		{Type: msgTypeDataRow, Data: []byte("2|Jane")},
 		{Type: msgTypeCommandComplete, Data: []byte("SELECT 2")},
 	}
-	
+
 	result, _ := validator.ValidateResults(identicalPG, identicalYB)
 	if result.ShouldFail {
 		fmt.Println("   ❌ Identical results validation failed")
 	} else {
 		fmt.Println("   ✅ Identical results: PASS - Client receives YugabyteDB results")
 	}
-	
+
 	// Demo 2: Different results (should fail)
 	differentYB := []*PGMessage{
 		{Type: msgTypeRowDescription, Data: []byte("id|name")},
@@ -62,7 +62,7 @@ func DemoToolOperation() {
 		{Type: msgTypeDataRow, Data: []byte("2|Bob")}, // Different data
 		{Type: msgTypeCommandComplete, Data: []byte("SELECT 2")},
 	}
-	
+
 	result, _ = validator.ValidateResults(identicalPG, differentYB)
 	if result.ShouldFail {
 		fmt.Println("   ✅ Different results: FAIL - Client receives SQL error")
@@ -70,7 +70,7 @@ func DemoToolOperation() {
 	} else {
 		fmt.Println("   ❌ Different results validation should have failed")
 	}
-	
+
 	// Step 4: Demonstrate allowed exceptions
 	fmt.Println("\n🚫 Step 4: Allowed Exceptions Demo")
 	testQueries := []string{
@@ -79,7 +79,7 @@ func DemoToolOperation() {
 		"SELECT version()",
 		"INSERT INTO test VALUES (1)",
 	}
-	
+
 	for _, query := range testQueries {
 		shouldCompare := config.ShouldCompareQuery(query)
 		if shouldCompare {
@@ -88,7 +88,7 @@ func DemoToolOperation() {
 			fmt.Printf("   ⏭️  '%s' -> SKIPPED (allowed exception)\n", query)
 		}
 	}
-	
+
 	// Step 5: Demonstrate ordered results
 	fmt.Println("\n📊 Step 5: Ordered Results Demo")
 	testOrderQueries := []string{
@@ -96,7 +96,7 @@ func DemoToolOperation() {
 		"SELECT * FROM users ORDER BY name",
 		"INSERT INTO test VALUES (1)",
 	}
-	
+
 	for _, query := range testOrderQueries {
 		orderedQuery := config.AddOrderByToQuery(query)
 		if orderedQuery != query {
@@ -105,7 +105,7 @@ func DemoToolOperation() {
 			fmt.Printf("   ➡️  '%s' -> No change needed\n", query)
 		}
 	}
-	
+
 	// Step 6: Show the complete workflow
 	fmt.Println("\n🔄 Step 6: Complete Workflow Summary")
 	fmt.Println("   1. Client sends SQL query to proxy (port 5431)")
@@ -118,7 +118,7 @@ func DemoToolOperation() {
 	fmt.Println("   5. Client receives either:")
 	fmt.Println("      - ✅ YugabyteDB results (success)")
 	fmt.Println("      - ❌ SQL error with difference details (test failure)")
-	
+
 	fmt.Println("\n🎯 VALIDATION COMPLETE")
 	fmt.Println("Tool meets all requirements:")
 	fmt.Println("✅ Sends sample commands to PG and YB")
