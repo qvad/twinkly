@@ -1,6 +1,23 @@
 -- YugabyteDB initialization script for integration tests
 -- Note: This runs after YugabyteDB starts, may need manual execution
 
+-- Create test user and database
+-- Ignore errors if they exist (idempotency is hard without IF NOT EXISTS for users in older PG compat, but YB might support it)
+-- We use DO block for idempotency if possible, or just ignore errors.
+-- Actually, we dropped everything in previous steps, but user/db persist.
+
+DROP DATABASE IF EXISTS testdb;
+DROP USER IF EXISTS testuser;
+CREATE USER testuser WITH PASSWORD 'testpass';
+CREATE DATABASE testdb WITH OWNER testuser;
+
+\c testdb
+
+DROP VIEW IF EXISTS user_order_summary;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS products;
+DROP TABLE IF EXISTS users;
+
 -- Create test tables (same structure as PostgreSQL for compatibility testing)
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,

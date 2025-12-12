@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -81,6 +83,31 @@ func extractDataRows(messages []*protocol.PGMessage) []*protocol.PGMessage {
 		}
 	}
 	return dataRows
+}
+
+// extractSampleData extracts a sample or checksum of the result set
+func extractSampleData(messages []*protocol.PGMessage) []string {
+	dataRows := extractDataRows(messages)
+	count := len(dataRows)
+	var sample []string
+
+	if count < 20 {
+		for i, row := range dataRows {
+			// Convert raw bytes to hex string for display since we don't know the encoding/types easily here
+			// without deep protocol parsing context (RowDescription is in separate message).
+			// A simple hex dump is safe.
+			hexData := hex.EncodeToString(row.Data)
+			sample = append(sample, fmt.Sprintf("Row %d: %s", i+1, hexData))
+		}
+	} else {
+		hasher := md5.New()
+		for _, row := range dataRows {
+			hasher.Write(row.Data)
+		}
+		checksum := hex.EncodeToString(hasher.Sum(nil))
+		sample = append(sample, fmt.Sprintf("MD5 Checksum: %s (Total rows: %d)", checksum, count))
+	}
+	return sample
 }
 
 // GetReporter returns the inconsistency reporter for summary generation

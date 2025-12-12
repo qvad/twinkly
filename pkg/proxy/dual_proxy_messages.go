@@ -273,11 +273,17 @@ func (p *DualExecutionProxy) proxyExtendedDualMessage(msg *protocol.PGMessage, c
 				}
 				// If not failing transaction, optionally report per config
 				if p.config.Comparison.SyntaxErrorDivergenceReport {
-					pgSummary := reporter.ResultSummary{Success: pgErr == nil}
+					pgSummary := reporter.ResultSummary{
+						Success:    pgErr == nil,
+						SampleData: extractSampleData(pgResults),
+					}
 					if pgErr != nil {
 						pgSummary.Error = pgErr.Error()
 					}
-					ybSummary := reporter.ResultSummary{Success: ybErr == nil}
+					ybSummary := reporter.ResultSummary{
+						Success:    ybErr == nil,
+						SampleData: extractSampleData(ybResults),
+					}
 					if ybErr != nil {
 						ybSummary.Error = ybErr.Error()
 					}
@@ -288,11 +294,17 @@ func (p *DualExecutionProxy) proxyExtendedDualMessage(msg *protocol.PGMessage, c
 			} else {
 				// Non-syntax divergence: optionally report as CRITICAL
 				if !ignoreCatalog {
-					pgSummary := reporter.ResultSummary{Success: pgErr == nil}
+					pgSummary := reporter.ResultSummary{
+						Success:    pgErr == nil,
+						SampleData: extractSampleData(pgResults),
+					}
 					if pgErr != nil {
 						pgSummary.Error = pgErr.Error()
 					}
-					ybSummary := reporter.ResultSummary{Success: ybErr == nil}
+					ybSummary := reporter.ResultSummary{
+						Success:    ybErr == nil,
+						SampleData: extractSampleData(ybResults),
+					}
 					if ybErr != nil {
 						ybSummary.Error = ybErr.Error()
 					}
@@ -311,8 +323,16 @@ func (p *DualExecutionProxy) proxyExtendedDualMessage(msg *protocol.PGMessage, c
 			log.Printf("Query result comparison (extended) - PostgreSQL: %d rows, YugabyteDB: %d rows", len(pgData), len(ybData))
 		}
 		if len(pgData) != len(ybData) {
-			pgSummary := reporter.ResultSummary{Success: true, RowCount: len(pgData)}
-			ybSummary := reporter.ResultSummary{Success: true, RowCount: len(ybData)}
+			pgSummary := reporter.ResultSummary{
+				Success:    true,
+				RowCount:   len(pgData),
+				SampleData: extractSampleData(pgResults),
+			}
+			ybSummary := reporter.ResultSummary{
+				Success:    true,
+				RowCount:   len(ybData),
+				SampleData: extractSampleData(ybResults),
+			}
 			diffs := []string{
 				"Row count differs",
 			}
@@ -336,8 +356,16 @@ func (p *DualExecutionProxy) proxyExtendedDualMessage(msg *protocol.PGMessage, c
 					reporter.DataValueMismatch,
 					severity,
 					"(extended protocol unit)",
-					reporter.ResultSummary{Success: true, RowCount: len(pgDataRows)},
-					reporter.ResultSummary{Success: true, RowCount: len(ybDataRows)},
+					reporter.ResultSummary{
+						Success:    true,
+						RowCount:   len(pgDataRows),
+						SampleData: extractSampleData(pgResults),
+					},
+					reporter.ResultSummary{
+						Success:    true,
+						RowCount:   len(ybDataRows),
+						SampleData: extractSampleData(ybResults),
+					},
 					validation.Differences,
 				)
 			}

@@ -1,5 +1,10 @@
 -- PostgreSQL initialization script for integration tests
 
+DROP VIEW IF EXISTS user_order_summary;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS products;
+DROP TABLE IF EXISTS users;
+
 -- Create test tables
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,

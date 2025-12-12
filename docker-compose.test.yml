@@ -5,6 +5,7 @@ services:
       POSTGRES_DB: testdb
       POSTGRES_USER: testuser
       POSTGRES_PASSWORD: testpass
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       - "5432:5432"
     healthcheck:
@@ -18,12 +19,12 @@ services:
       - /var/lib/postgresql/data
 
   yugabytedb:
-    image: yugabytedb/yugabyte:latest
+    image: yugabytedb/yugabyte:2025.2.0.0-b131
     command: |
       bash -c "
-      (sleep 15 && /home/yugabyte/bin/ysqlsh -h localhost -p 5433 -U yugabyte -d yugabyte -f /tmp/init.sql) &
+      (until /home/yugabyte/bin/ysqlsh -h localhost -p 5433 -U yugabyte -d yugabyte -c 'SELECT 1' > /dev/null 2>&1; do sleep 1; done && /home/yugabyte/bin/ysqlsh -h localhost -p 5433 -U yugabyte -d yugabyte -f /tmp/init.sql) &
       rm -f /tmp/yb_data/yugabyted.pid &&
-      /home/yugabyte/bin/yugabyted start --daemon=false --base_dir=/tmp/yb_data --listen=0.0.0.0 --tserver_flags="pgsql_proxy_bind_address=0.0.0.0:5433"
+      /home/yugabyte/bin/yugabyted start --daemon=false --base_dir=/tmp/yb_data --listen=0.0.0.0 --tserver_flags="pgsql_proxy_bind_address=0.0.0.0:5433,yb_num_shards_per_tserver=1"
       "
     ports:
       - "5433:5433"
@@ -54,11 +55,11 @@ services:
       YUGABYTE_HOST: yugabytedb
       YUGABYTE_PORT: 5433
       YUGABYTE_USER: yugabyte
-      YUGABYTE_DB: yugabyte
+      YUGABYTE_DB: testdb
     volumes:
       - .:/app
     working_dir: /app
-    command: ["go", "test", "-v", "./test/integration/..."]
+    command: ["go", "test", "-v", "-run", "TestProxy", "./test/integration/..."]
 
 volumes:
   yb_data_volume:

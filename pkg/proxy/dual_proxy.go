@@ -106,6 +106,7 @@ func (p *DualExecutionProxy) HandleConnection(clientConn net.Conn) {
 
 	pgConn, err := net.DialTimeout("tcp", p.pgAddr, 10*time.Second)
 	if err != nil {
+		log.Printf("Failed to dial PostgreSQL (%s): %v", p.pgAddr, err)
 		return
 	}
 	// Disable backend TLS for now to avoid SCRAM-SHA-256-PLUS issues with non-SSL clients
@@ -114,6 +115,7 @@ func (p *DualExecutionProxy) HandleConnection(clientConn net.Conn) {
 
 	ybConn, err := net.DialTimeout("tcp", p.ybAddr, 10*time.Second)
 	if err != nil {
+		log.Printf("Failed to dial YugabyteDB (%s): %v", p.ybAddr, err)
 		return
 	}
 	// ybConn, _ = p.maybeEnableBackendTLS(ybConn, p.config.Proxy.YugabyteDB.Host, "YugabyteDB")
@@ -316,8 +318,22 @@ func (p *DualExecutionProxy) executeDualQuery(msg *protocol.PGMessage, query str
 		p.logSecondaryDisabled("result mismatch")
 
 		// Report inconsistency
-		pgSummary := reporter.ResultSummary{Success: pgErr == nil, RowCount: len(extractDataRows(pgResults))}
-		ybSummary := reporter.ResultSummary{Success: ybErr == nil, RowCount: len(extractDataRows(ybResults))}
+		pgSummary := reporter.ResultSummary{
+			Success:    pgErr == nil,
+			RowCount:   len(extractDataRows(pgResults)),
+			SampleData: extractSampleData(pgResults),
+		}
+		if pgErr != nil {
+			pgSummary.Error = pgErr.Error()
+		}
+		ybSummary := reporter.ResultSummary{
+			Success:    ybErr == nil,
+			RowCount:   len(extractDataRows(ybResults)),
+			SampleData: extractSampleData(ybResults),
+		}
+		if ybErr != nil {
+			ybSummary.Error = ybErr.Error()
+		}
 		p.reporter.ReportInconsistency(reporter.DataValueMismatch, "HIGH", query, pgSummary, ybSummary, differences)
 
 		if p.slowQueryAnalyzer != nil && p.config.Comparison.AI.Enabled {
