@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -249,7 +250,17 @@ type ErrorSimulation struct {
 
 // LoadConfig loads configuration from file
 func LoadConfig(filename string) (*Config, error) {
-	conf, err := hocon.ParseResource(filename)
+	// Read file content
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	// Substitute environment variables
+	expandedContent := os.ExpandEnv(string(content))
+
+	// Parse the expanded content
+	conf, err := hocon.ParseString(expandedContent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
