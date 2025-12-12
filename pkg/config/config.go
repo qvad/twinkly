@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"fmt"
@@ -92,10 +92,22 @@ type ComparisonConfig struct {
 	// EXPLAIN configuration (structured form for tests)
 	ExplainOptions ExplainAnalyzeOptions
 
+	// AI Analysis configuration
+	AI AIAnalysisConfig
+
 	// Compiled exclude patterns
 	excludePatterns []*regexp.Regexp
 	// Compiled catalog patterns
 	catalogPatterns []*regexp.Regexp
+}
+
+// AIAnalysisConfig contains settings for AI-based discrepancy analysis
+type AIAnalysisConfig struct {
+	Enabled  bool
+	Provider string // "mock", "gemini", "openai"
+	APIKey   string
+	Endpoint string
+	Model    string
 }
 
 // ExplainAnalyzeOptions groups per-DB EXPLAIN options
@@ -357,6 +369,16 @@ func LoadConfig(filename string) (*Config, error) {
 		Dist:    true,
 		Debug:   false,
 	}
+
+	// Load AI Analysis config
+	cfg.Comparison.AI.Enabled = conf.GetBoolean("comparison.ai.enabled")
+	cfg.Comparison.AI.Provider = conf.GetString("comparison.ai.provider")
+	if cfg.Comparison.AI.Provider == "" {
+		cfg.Comparison.AI.Provider = "mock"
+	}
+	cfg.Comparison.AI.APIKey = conf.GetString("comparison.ai.api-key")
+	cfg.Comparison.AI.Endpoint = conf.GetString("comparison.ai.endpoint")
+	cfg.Comparison.AI.Model = conf.GetString("comparison.ai.model")
 
 	// Load and compile exclude patterns
 	excludePatterns := conf.GetStringSlice("comparison.exclude-patterns")

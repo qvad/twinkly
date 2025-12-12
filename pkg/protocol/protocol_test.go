@@ -1,4 +1,4 @@
-package main
+package protocol_test
 
 import (
 	"bytes"
@@ -7,54 +7,56 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/qvad/twinkly/pkg/protocol"
 )
 
 // TestPGProtocolReaderWriter tests the PostgreSQL protocol reader/writer implementation
 func TestPGProtocolReaderWriter(t *testing.T) {
 	t.Run("ReadWriteQueryMessage", func(t *testing.T) {
 		var buffer bytes.Buffer
-		
+
 		// Test writing a query message
-		writer := NewPGProtocolWriter(&buffer)
-		queryMsg := &PGMessage{
-			Type: msgTypeQuery,
+		writer := protocol.NewPGProtocolWriter(&buffer)
+		queryMsg := &protocol.PGMessage{
+			Type: protocol.MsgTypeQuery,
 			Data: []byte("SELECT * FROM users WHERE id = $1\x00"),
 		}
-		
+
 		err := writer.WriteMessage(queryMsg)
 		if err != nil {
 			t.Fatalf("Failed to write query message: %v", err)
 		}
-		
+
 		// Verify written format
 		data := buffer.Bytes()
 		if len(data) < 5 {
 			t.Fatalf("Expected at least 5 bytes (type + length), got %d", len(data))
 		}
-		
+
 		// Check message type
-		if data[0] != msgTypeQuery {
-			t.Errorf("Expected message type 'Q' (%d), got %d", msgTypeQuery, data[0])
+		if data[0] != protocol.MsgTypeQuery {
+			t.Errorf("Expected message type 'Q' (%d), got %d", protocol.MsgTypeQuery, data[0])
 		}
-		
+
 		// Check length
 		length := binary.BigEndian.Uint32(data[1:5])
 		expectedLength := uint32(len(queryMsg.Data) + 4)
 		if length != expectedLength {
 			t.Errorf("Expected length %d, got %d", expectedLength, length)
 		}
-		
+
 		// Test reading it back
-		reader := NewPGProtocolReader(&buffer)
+		reader := protocol.NewPGProtocolReader(&buffer)
 		readMsg, err := reader.ReadMessage()
 		if err != nil {
 			t.Fatalf("Failed to read message: %v", err)
 		}
-		
+
 		if readMsg.Type != queryMsg.Type {
 			t.Errorf("Expected type %c, got %c", queryMsg.Type, readMsg.Type)
 		}
-		
+
 		if !bytes.Equal(readMsg.Data, queryMsg.Data) {
 			t.Errorf("Expected data %v, got %v", queryMsg.Data, readMsg.Data)
 		}
@@ -62,27 +64,27 @@ func TestPGProtocolReaderWriter(t *testing.T) {
 
 	t.Run("ReadWriteErrorMessage", func(t *testing.T) {
 		var buffer bytes.Buffer
-		writer := NewPGProtocolWriter(&buffer)
-		
+		writer := protocol.NewPGProtocolWriter(&buffer)
+
 		// Create error message
-		errorMsg := CreateErrorMessage("ERROR", "42P01", "relation \"nonexistent\" does not exist")
-		
+		errorMsg := protocol.CreateErrorMessage("ERROR", "42P01", "relation \"nonexistent\" does not exist")
+
 		err := writer.WriteMessage(errorMsg)
 		if err != nil {
 			t.Fatalf("Failed to write error message: %v", err)
 		}
-		
+
 		// Read it back
-		reader := NewPGProtocolReader(&buffer)
+		reader := protocol.NewPGProtocolReader(&buffer)
 		readMsg, err := reader.ReadMessage()
 		if err != nil {
 			t.Fatalf("Failed to read error message: %v", err)
 		}
-		
-		if readMsg.Type != msgTypeErrorResponse {
+
+		if readMsg.Type != protocol.MsgTypeErrorResponse {
 			t.Errorf("Expected error response type 'E', got %c", readMsg.Type)
 		}
-		
+
 		// Verify error message contains expected fields
 		data := string(readMsg.Data)
 		if !strings.Contains(data, "ERROR") {
@@ -98,30 +100,30 @@ func TestPGProtocolReaderWriter(t *testing.T) {
 
 	t.Run("ReadWriteDataRowMessage", func(t *testing.T) {
 		var buffer bytes.Buffer
-		writer := NewPGProtocolWriter(&buffer)
-		
+		writer := protocol.NewPGProtocolWriter(&buffer)
+
 		// Create data row message
-		dataMsg := &PGMessage{
-			Type: msgTypeDataRow,
+		dataMsg := &protocol.PGMessage{
+			Type: protocol.MsgTypeDataRow,
 			Data: []byte{0, 2, 0, 0, 0, 1, '1', 0, 0, 0, 4, 'J', 'o', 'h', 'n'}, // 2 columns: "1", "John"
 		}
-		
+
 		err := writer.WriteMessage(dataMsg)
 		if err != nil {
 			t.Fatalf("Failed to write data row message: %v", err)
 		}
-		
+
 		// Read it back
-		reader := NewPGProtocolReader(&buffer)
+		reader := protocol.NewPGProtocolReader(&buffer)
 		readMsg, err := reader.ReadMessage()
 		if err != nil {
 			t.Fatalf("Failed to read data row message: %v", err)
 		}
-		
-		if readMsg.Type != msgTypeDataRow {
+
+		if readMsg.Type != protocol.MsgTypeDataRow {
 			t.Errorf("Expected data row type 'D', got %c", readMsg.Type)
 		}
-		
+
 		if !bytes.Equal(readMsg.Data, dataMsg.Data) {
 			t.Errorf("Expected data %v, got %v", dataMsg.Data, readMsg.Data)
 		}
@@ -129,30 +131,30 @@ func TestPGProtocolReaderWriter(t *testing.T) {
 
 	t.Run("ReadWriteReadyForQueryMessage", func(t *testing.T) {
 		var buffer bytes.Buffer
-		writer := NewPGProtocolWriter(&buffer)
-		
+		writer := protocol.NewPGProtocolWriter(&buffer)
+
 		// Create ready for query message
-		readyMsg := &PGMessage{
-			Type: msgTypeReadyForQuery,
+		readyMsg := &protocol.PGMessage{
+			Type: protocol.MsgTypeReadyForQuery,
 			Data: []byte{'I'}, // Idle transaction state
 		}
-		
+
 		err := writer.WriteMessage(readyMsg)
 		if err != nil {
 			t.Fatalf("Failed to write ready message: %v", err)
 		}
-		
+
 		// Read it back
-		reader := NewPGProtocolReader(&buffer)
+		reader := protocol.NewPGProtocolReader(&buffer)
 		readMsg, err := reader.ReadMessage()
 		if err != nil {
 			t.Fatalf("Failed to read ready message: %v", err)
 		}
-		
-		if readMsg.Type != msgTypeReadyForQuery {
+
+		if readMsg.Type != protocol.MsgTypeReadyForQuery {
 			t.Errorf("Expected ready type 'Z', got %c", readMsg.Type)
 		}
-		
+
 		if len(readMsg.Data) != 1 || readMsg.Data[0] != 'I' {
 			t.Errorf("Expected ready data ['I'], got %v", readMsg.Data)
 		}
@@ -160,36 +162,36 @@ func TestPGProtocolReaderWriter(t *testing.T) {
 
 	t.Run("ReadWriteMultipleMessages", func(t *testing.T) {
 		var buffer bytes.Buffer
-		writer := NewPGProtocolWriter(&buffer)
-		
+		writer := protocol.NewPGProtocolWriter(&buffer)
+
 		// Write multiple messages
-		messages := []*PGMessage{
-			{Type: msgTypeRowDescription, Data: []byte("id\x00name\x00")},
-			{Type: msgTypeDataRow, Data: []byte("1\x00John\x00")},
-			{Type: msgTypeDataRow, Data: []byte("2\x00Jane\x00")},
-			{Type: msgTypeCommandComplete, Data: []byte("SELECT 2\x00")},
-			{Type: msgTypeReadyForQuery, Data: []byte{'I'}},
+		messages := []*protocol.PGMessage{
+			{Type: protocol.MsgTypeRowDescription, Data: []byte("id\x00name\x00")},
+			{Type: protocol.MsgTypeDataRow, Data: []byte("1\x00John\x00")},
+			{Type: protocol.MsgTypeDataRow, Data: []byte("2\x00Jane\x00")},
+			{Type: protocol.MsgTypeCommandComplete, Data: []byte("SELECT 2\x00")},
+			{Type: protocol.MsgTypeReadyForQuery, Data: []byte{'I'}},
 		}
-		
+
 		for _, msg := range messages {
 			err := writer.WriteMessage(msg)
 			if err != nil {
 				t.Fatalf("Failed to write message %c: %v", msg.Type, err)
 			}
 		}
-		
+
 		// Read them back
-		reader := NewPGProtocolReader(&buffer)
+		reader := protocol.NewPGProtocolReader(&buffer)
 		for i, expectedMsg := range messages {
 			readMsg, err := reader.ReadMessage()
 			if err != nil {
 				t.Fatalf("Failed to read message %d: %v", i, err)
 			}
-			
+
 			if readMsg.Type != expectedMsg.Type {
 				t.Errorf("Message %d: expected type %c, got %c", i, expectedMsg.Type, readMsg.Type)
 			}
-			
+
 			if !bytes.Equal(readMsg.Data, expectedMsg.Data) {
 				t.Errorf("Message %d: expected data %v, got %v", i, expectedMsg.Data, readMsg.Data)
 			}
@@ -201,8 +203,8 @@ func TestPGProtocolReaderWriter(t *testing.T) {
 func TestPGProtocolEdgeCases(t *testing.T) {
 	t.Run("ReadFromEmptyBuffer", func(t *testing.T) {
 		buffer := bytes.NewBuffer(nil)
-		reader := NewPGProtocolReader(buffer)
-		
+		reader := protocol.NewPGProtocolReader(buffer)
+
 		_, err := reader.ReadMessage()
 		if err == nil {
 			t.Error("Expected error when reading from empty buffer")
@@ -215,8 +217,8 @@ func TestPGProtocolEdgeCases(t *testing.T) {
 	t.Run("ReadIncompleteLength", func(t *testing.T) {
 		// Buffer with message type but incomplete length
 		buffer := bytes.NewBuffer([]byte{'Q', 0, 0})
-		reader := NewPGProtocolReader(buffer)
-		
+		reader := protocol.NewPGProtocolReader(buffer)
+
 		_, err := reader.ReadMessage()
 		if err == nil {
 			t.Error("Expected error when reading incomplete length")
@@ -226,8 +228,8 @@ func TestPGProtocolEdgeCases(t *testing.T) {
 	t.Run("ReadIncompleteData", func(t *testing.T) {
 		// Buffer with type and length but incomplete data
 		buffer := bytes.NewBuffer([]byte{'Q', 0, 0, 0, 10, 'S', 'E', 'L'}) // Says 10 bytes but only has 3
-		reader := NewPGProtocolReader(buffer)
-		
+		reader := protocol.NewPGProtocolReader(buffer)
+
 		_, err := reader.ReadMessage()
 		if err == nil {
 			t.Error("Expected error when reading incomplete data")
@@ -237,9 +239,9 @@ func TestPGProtocolEdgeCases(t *testing.T) {
 	t.Run("WriteToFailingWriter", func(t *testing.T) {
 		// Create a writer that always fails
 		failingWriter := &FailingWriter{}
-		writer := NewPGProtocolWriter(failingWriter)
-		
-		msg := &PGMessage{Type: msgTypeQuery, Data: []byte("SELECT 1")}
+		writer := protocol.NewPGProtocolWriter(failingWriter)
+
+		msg := &protocol.PGMessage{Type: protocol.MsgTypeQuery, Data: []byte("SELECT 1")}
 		err := writer.WriteMessage(msg)
 		if err == nil {
 			t.Error("Expected error when writing to failing writer")
@@ -248,30 +250,30 @@ func TestPGProtocolEdgeCases(t *testing.T) {
 
 	t.Run("ReadLargeMessage", func(t *testing.T) {
 		var buffer bytes.Buffer
-		writer := NewPGProtocolWriter(&buffer)
-		
+		writer := protocol.NewPGProtocolWriter(&buffer)
+
 		// Create a large message (but reasonable)
 		largeData := make([]byte, 1024*1024) // 1MB
 		for i := range largeData {
 			largeData[i] = 'A'
 		}
-		
-		largeMsg := &PGMessage{
-			Type: msgTypeQuery,
+
+		largeMsg := &protocol.PGMessage{
+			Type: protocol.MsgTypeQuery,
 			Data: largeData,
 		}
-		
+
 		err := writer.WriteMessage(largeMsg)
 		if err != nil {
 			t.Fatalf("Failed to write large message: %v", err)
 		}
-		
-		reader := NewPGProtocolReader(&buffer)
+
+		reader := protocol.NewPGProtocolReader(&buffer)
 		readMsg, err := reader.ReadMessage()
 		if err != nil {
 			t.Fatalf("Failed to read large message: %v", err)
 		}
-		
+
 		if !bytes.Equal(readMsg.Data, largeData) {
 			t.Error("Large message data corrupted during read/write")
 		}
@@ -280,43 +282,43 @@ func TestPGProtocolEdgeCases(t *testing.T) {
 	t.Run("HandleStartupMessage", func(t *testing.T) {
 		// Test startup message (no message type, just length + data)
 		var buffer bytes.Buffer
-		
+
 		// Create startup message manually
 		protocolVersion := make([]byte, 4)
 		binary.BigEndian.PutUint32(protocolVersion, 196608) // Protocol 3.0
-		
+
 		params := []byte("user\x00testuser\x00database\x00testdb\x00\x00")
 		messageBody := append(protocolVersion, params...)
-		
+
 		// Length includes itself
 		length := make([]byte, 4)
 		binary.BigEndian.PutUint32(length, uint32(len(messageBody)+4))
-		
+
 		startupMsg := append(length, messageBody...)
 		buffer.Write(startupMsg)
-		
+
 		// Try to read with regular reader (this will fail because startup messages have no type)
-		_ = NewPGProtocolReader(&buffer)
-		
+		_ = protocol.NewPGProtocolReader(&buffer)
+
 		// First 4 bytes should be length
 		lengthBytes := make([]byte, 4)
 		n, err := buffer.Read(lengthBytes)
 		if err != nil || n != 4 {
 			t.Fatalf("Failed to read startup message length: %v", err)
 		}
-		
+
 		msgLen := binary.BigEndian.Uint32(lengthBytes)
 		if msgLen != uint32(len(messageBody)+4) {
 			t.Errorf("Expected startup message length %d, got %d", len(messageBody)+4, msgLen)
 		}
-		
+
 		// Read the body
 		body := make([]byte, msgLen-4)
 		n, err = buffer.Read(body)
 		if err != nil || n != len(body) {
 			t.Fatalf("Failed to read startup message body: %v", err)
 		}
-		
+
 		// Verify protocol version
 		version := binary.BigEndian.Uint32(body[0:4])
 		if version != 196608 {
@@ -335,25 +337,25 @@ func TestPGMessageConstruction(t *testing.T) {
 			"UPDATE users SET last_login = NOW() WHERE id = 1",
 			"DELETE FROM temp_data WHERE created < NOW() - INTERVAL '1 day'",
 		}
-		
+
 		for _, query := range queries {
-			msg := CreateQueryMessage(query)
+			msg := protocol.CreateQueryMessage(query)
 			if msg == nil {
 				t.Errorf("Failed to create message for query: %s", query)
 				continue
 			}
-			
-			if msg.Type != msgTypeQuery {
+
+			if msg.Type != protocol.MsgTypeQuery {
 				t.Errorf("Expected query type 'Q', got %c", msg.Type)
 			}
-			
+
 			// Parse it back and verify
-			parsedQuery, err := ParseQuery(msg)
+			parsedQuery, err := protocol.ParseQuery(msg)
 			if err != nil {
 				t.Errorf("Failed to parse created query: %v", err)
 				continue
 			}
-			
+
 			if parsedQuery != query {
 				t.Errorf("Query roundtrip failed: expected %q, got %q", query, parsedQuery)
 			}
@@ -372,18 +374,18 @@ func TestPGMessageConstruction(t *testing.T) {
 			{"FATAL", "08000", "connection failure"},
 			{"PANIC", "XX000", "system panic"},
 		}
-		
+
 		for _, tc := range errorCases {
-			msg := CreateErrorMessage(tc.severity, tc.code, tc.message)
+			msg := protocol.CreateErrorMessage(tc.severity, tc.code, tc.message)
 			if msg == nil {
 				t.Errorf("Failed to create error message for %s/%s", tc.severity, tc.code)
 				continue
 			}
-			
-			if msg.Type != msgTypeErrorResponse {
+
+			if msg.Type != protocol.MsgTypeErrorResponse {
 				t.Errorf("Expected error type 'E', got %c", msg.Type)
 			}
-			
+
 			// Verify all components are present
 			data := string(msg.Data)
 			if !strings.Contains(data, tc.severity) {
@@ -431,27 +433,27 @@ func TestPGMessageConstruction(t *testing.T) {
 				expected: "",
 			},
 		}
-		
+
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-				msg := &PGMessage{
-					Type: msgTypeQuery,
+				msg := &protocol.PGMessage{
+					Type: protocol.MsgTypeQuery,
 					Data: tc.msgData,
 				}
-				
-				result, err := ParseQuery(msg)
+
+				result, err := protocol.ParseQuery(msg)
 				if tc.expectError {
 					if err == nil {
 						t.Error("Expected error but got none")
 					}
 					return
 				}
-				
+
 				if err != nil {
 					t.Errorf("Unexpected error: %v", err)
 					return
 				}
-				
+
 				if result != tc.expected {
 					t.Errorf("Expected %q, got %q", tc.expected, result)
 				}
@@ -465,28 +467,28 @@ func TestPGProtocolAuthentication(t *testing.T) {
 	t.Run("AuthenticationOK", func(t *testing.T) {
 		// Authentication OK message: type 'R' + length (8) + auth type (0)
 		var buffer bytes.Buffer
-		writer := NewPGProtocolWriter(&buffer)
-		
-		authOKMsg := &PGMessage{
-			Type: msgTypeAuthentication,
+		writer := protocol.NewPGProtocolWriter(&buffer)
+
+		authOKMsg := &protocol.PGMessage{
+			Type: protocol.MsgTypeAuthentication,
 			Data: []byte{0, 0, 0, 0}, // Authentication OK (type 0)
 		}
-		
+
 		err := writer.WriteMessage(authOKMsg)
 		if err != nil {
 			t.Fatalf("Failed to write auth OK message: %v", err)
 		}
-		
-		reader := NewPGProtocolReader(&buffer)
+
+		reader := protocol.NewPGProtocolReader(&buffer)
 		readMsg, err := reader.ReadMessage()
 		if err != nil {
 			t.Fatalf("Failed to read auth OK message: %v", err)
 		}
-		
-		if readMsg.Type != msgTypeAuthentication {
+
+		if readMsg.Type != protocol.MsgTypeAuthentication {
 			t.Errorf("Expected auth type 'R', got %c", readMsg.Type)
 		}
-		
+
 		if !bytes.Equal(readMsg.Data, authOKMsg.Data) {
 			t.Errorf("Expected auth data %v, got %v", authOKMsg.Data, readMsg.Data)
 		}
@@ -494,29 +496,29 @@ func TestPGProtocolAuthentication(t *testing.T) {
 
 	t.Run("ParameterStatus", func(t *testing.T) {
 		var buffer bytes.Buffer
-		writer := NewPGProtocolWriter(&buffer)
-		
+		writer := protocol.NewPGProtocolWriter(&buffer)
+
 		// Parameter status message: type 'S' + length + name + null + value + null
-		paramMsg := &PGMessage{
-			Type: msgTypeParameterStatus,
+		paramMsg := &protocol.PGMessage{
+			Type: protocol.MsgTypeParameterStatus,
 			Data: []byte("server_version\x00PostgreSQL 13.7\x00"),
 		}
-		
+
 		err := writer.WriteMessage(paramMsg)
 		if err != nil {
 			t.Fatalf("Failed to write parameter status: %v", err)
 		}
-		
-		reader := NewPGProtocolReader(&buffer)
+
+		reader := protocol.NewPGProtocolReader(&buffer)
 		readMsg, err := reader.ReadMessage()
 		if err != nil {
 			t.Fatalf("Failed to read parameter status: %v", err)
 		}
-		
-		if readMsg.Type != msgTypeParameterStatus {
+
+		if readMsg.Type != protocol.MsgTypeParameterStatus {
 			t.Errorf("Expected parameter status type 'S', got %c", readMsg.Type)
 		}
-		
+
 		data := string(readMsg.Data)
 		if !strings.Contains(data, "server_version") {
 			t.Error("Expected parameter name 'server_version'")
@@ -528,41 +530,41 @@ func TestPGProtocolAuthentication(t *testing.T) {
 
 	t.Run("BackendKeyData", func(t *testing.T) {
 		var buffer bytes.Buffer
-		writer := NewPGProtocolWriter(&buffer)
-		
+		writer := protocol.NewPGProtocolWriter(&buffer)
+
 		// Backend key data: type 'K' + length (12) + process_id (4) + secret_key (4)
 		keyData := make([]byte, 8)
 		binary.BigEndian.PutUint32(keyData[0:4], 12345) // Process ID
 		binary.BigEndian.PutUint32(keyData[4:8], 67890) // Secret key
-		
-		keyMsg := &PGMessage{
-			Type: msgTypeBackendKeyData,
+
+		keyMsg := &protocol.PGMessage{
+			Type: protocol.MsgTypeBackendKeyData,
 			Data: keyData,
 		}
-		
+
 		err := writer.WriteMessage(keyMsg)
 		if err != nil {
 			t.Fatalf("Failed to write backend key data: %v", err)
 		}
-		
-		reader := NewPGProtocolReader(&buffer)
+
+		reader := protocol.NewPGProtocolReader(&buffer)
 		readMsg, err := reader.ReadMessage()
 		if err != nil {
 			t.Fatalf("Failed to read backend key data: %v", err)
 		}
-		
-		if readMsg.Type != msgTypeBackendKeyData {
+
+		if readMsg.Type != protocol.MsgTypeBackendKeyData {
 			t.Errorf("Expected backend key type 'K', got %c", readMsg.Type)
 		}
-		
+
 		if len(readMsg.Data) != 8 {
 			t.Errorf("Expected 8 bytes of key data, got %d", len(readMsg.Data))
 		}
-		
+
 		// Verify process ID and secret key
 		processID := binary.BigEndian.Uint32(readMsg.Data[0:4])
 		secretKey := binary.BigEndian.Uint32(readMsg.Data[4:8])
-		
+
 		if processID != 12345 {
 			t.Errorf("Expected process ID 12345, got %d", processID)
 		}
@@ -576,33 +578,33 @@ func TestPGProtocolAuthentication(t *testing.T) {
 func TestPGProtocolConcurrency(t *testing.T) {
 	t.Run("ConcurrentWrites", func(t *testing.T) {
 		var buffer bytes.Buffer
-		writer := NewPGProtocolWriter(&buffer)
-		
+		writer := protocol.NewPGProtocolWriter(&buffer)
+
 		// Use a channel to synchronize writes
 		done := make(chan bool, 10)
-		
+
 		// Write 10 messages concurrently
 		for i := 0; i < 10; i++ {
 			go func(id int) {
 				defer func() { done <- true }()
-				
-				msg := &PGMessage{
-					Type: msgTypeQuery,
+
+				msg := &protocol.PGMessage{
+					Type: protocol.MsgTypeQuery,
 					Data: []byte(fmt.Sprintf("SELECT %d\x00", id)),
 				}
-				
+
 				err := writer.WriteMessage(msg)
 				if err != nil {
 					t.Errorf("Failed to write message %d: %v", id, err)
 				}
 			}(i)
 		}
-		
+
 		// Wait for all writes to complete
 		for i := 0; i < 10; i++ {
 			<-done
 		}
-		
+
 		// Verify we got some data (exact verification is hard due to concurrency)
 		if buffer.Len() == 0 {
 			t.Error("Expected some data to be written")
@@ -625,36 +627,36 @@ func (fw *FailingWriter) Write(p []byte) (n int, err error) {
 // TestPGProtocolConstants tests that protocol constants are correctly defined
 func TestPGProtocolConstants(t *testing.T) {
 	expectedConstants := map[string]byte{
-		"msgTypeQuery":           'Q',
-		"msgTypeTerminate":       'X',
-		"msgTypeReadyForQuery":   'Z',
-		"msgTypeErrorResponse":   'E',
-		"msgTypeDataRow":         'D',
-		"msgTypeRowDescription":  'T',
-		"msgTypeCommandComplete": 'C',
-		"msgTypeAuthentication":  'R',
-		"msgTypeParameterStatus": 'S',
-		"msgTypeBackendKeyData":  'K',
+		"MsgTypeQuery":           'Q',
+		"MsgTypeTerminate":       'X',
+		"MsgTypeReadyForQuery":   'Z',
+		"MsgTypeErrorResponse":   'E',
+		"MsgTypeDataRow":         'D',
+		"MsgTypeRowDescription":  'T',
+		"MsgTypeCommandComplete": 'C',
+		"MsgTypeAuthentication":  'R',
+		"MsgTypeParameterStatus": 'S',
+		"MsgTypeBackendKeyData":  'K',
 	}
-	
+
 	actualConstants := map[string]byte{
-		"msgTypeQuery":           msgTypeQuery,
-		"msgTypeTerminate":       msgTypeTerminate,
-		"msgTypeReadyForQuery":   msgTypeReadyForQuery,
-		"msgTypeErrorResponse":   msgTypeErrorResponse,
-		"msgTypeDataRow":         msgTypeDataRow,
-		"msgTypeRowDescription":  msgTypeRowDescription,
-		"msgTypeCommandComplete": msgTypeCommandComplete,
-		"msgTypeAuthentication":  msgTypeAuthentication,
-		"msgTypeParameterStatus": msgTypeParameterStatus,
-		"msgTypeBackendKeyData":  msgTypeBackendKeyData,
+		"MsgTypeQuery":           protocol.MsgTypeQuery,
+		"MsgTypeTerminate":       protocol.MsgTypeTerminate,
+		"MsgTypeReadyForQuery":   protocol.MsgTypeReadyForQuery,
+		"MsgTypeErrorResponse":   protocol.MsgTypeErrorResponse,
+		"MsgTypeDataRow":         protocol.MsgTypeDataRow,
+		"MsgTypeRowDescription":  protocol.MsgTypeRowDescription,
+		"MsgTypeCommandComplete": protocol.MsgTypeCommandComplete,
+		"MsgTypeAuthentication":  protocol.MsgTypeAuthentication,
+		"MsgTypeParameterStatus": protocol.MsgTypeParameterStatus,
+		"MsgTypeBackendKeyData":  protocol.MsgTypeBackendKeyData,
 	}
-	
+
 	for name, expected := range expectedConstants {
 		if actual, exists := actualConstants[name]; !exists {
 			t.Errorf("Constant %s not defined", name)
 		} else if actual != expected {
-			t.Errorf("Constant %s: expected %c (%d), got %c (%d)", 
+			t.Errorf("Constant %s: expected %c (%d), got %c (%d)",
 				name, expected, expected, actual, actual)
 		}
 	}
@@ -663,15 +665,15 @@ func TestPGProtocolConstants(t *testing.T) {
 // TestPGProtocolLogMessage tests the LogMessage utility
 func TestPGProtocolLogMessage(t *testing.T) {
 	// This test just ensures LogMessage doesn't panic
-	messages := []*PGMessage{
-		{Type: msgTypeQuery, Data: []byte("SELECT 1")},
-		{Type: msgTypeErrorResponse, Data: []byte("ERROR: test")},
-		{Type: msgTypeDataRow, Data: []byte("data")},
-		{Type: msgTypeTerminate, Data: []byte{}},
+	messages := []*protocol.PGMessage{
+		{Type: protocol.MsgTypeQuery, Data: []byte("SELECT 1")},
+		{Type: protocol.MsgTypeErrorResponse, Data: []byte("ERROR: test")},
+		{Type: protocol.MsgTypeDataRow, Data: []byte("data")},
+		{Type: protocol.MsgTypeTerminate, Data: []byte{}},
 	}
-	
+
 	for _, msg := range messages {
 		// LogMessage should not panic
-		LogMessage("TEST", msg)
+		protocol.LogMessage("TEST", msg)
 	}
 }

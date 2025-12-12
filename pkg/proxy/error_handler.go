@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"context"
@@ -7,15 +7,17 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/qvad/twinkly/pkg/config"
 )
 
 // ErrorHandler manages error mapping and retry logic
 type ErrorHandler struct {
-	config *Config
+	config *config.Config
 }
 
 // NewErrorHandler creates a new error handler
-func NewErrorHandler(config *Config) *ErrorHandler {
+func NewErrorHandler(config *config.Config) *ErrorHandler {
 	return &ErrorHandler{config: config}
 }
 
@@ -32,7 +34,7 @@ type PostgreSQLError struct {
 func ParsePostgreSQLError(err error) (*PostgreSQLError, bool) {
 	// This is a simplified version - real implementation would parse the error protocol message
 	errStr := err.Error()
-	
+
 	// Look for SQLSTATE in error message
 	if strings.Contains(errStr, "SQLSTATE") {
 		// Extract SQLSTATE code (simplified)
@@ -45,7 +47,7 @@ func ParsePostgreSQLError(err error) (*PostgreSQLError, bool) {
 			}, true
 		}
 	}
-	
+
 	return nil, false
 }
 
@@ -56,14 +58,14 @@ func (eh *ErrorHandler) HandleError(err error, fromDB string, operation func() e
 		// Not a PostgreSQL error, pass through
 		return err
 	}
-	
+
 	// Map the error
 	mappedCode, action, found := eh.config.MapError(pgErr.Code, fromDB)
 	if !found {
 		// No mapping found, pass through
 		return err
 	}
-	
+
 	switch action {
 	case "retry":
 		return eh.handleRetry(pgErr, operation)
@@ -84,17 +86,17 @@ func (eh *ErrorHandler) handleRetry(pgErr *PostgreSQLError, operation func() err
 	if mapping == nil {
 		return fmt.Errorf("SQLSTATE %s: %s", pgErr.Code, pgErr.Message)
 	}
-	
+
 	maxRetries := mapping.MaxRetries
 	if maxRetries <= 0 {
 		maxRetries = 3 // default
 	}
-	
+
 	retryDelay := mapping.RetryDelay
 	if retryDelay == 0 {
 		retryDelay = 100 * time.Millisecond // default
 	}
-	
+
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
 		if i > 0 {
@@ -103,13 +105,13 @@ func (eh *ErrorHandler) handleRetry(pgErr *PostgreSQLError, operation func() err
 			}
 			time.Sleep(retryDelay)
 		}
-		
+
 		lastErr = operation()
 		if lastErr == nil {
 			// Success
 			return nil
 		}
-		
+
 		// Check if new error is also retryable
 		newPgErr, isPgErr := ParsePostgreSQLError(lastErr)
 		if !isPgErr || newPgErr.Code != pgErr.Code {
@@ -117,7 +119,7 @@ func (eh *ErrorHandler) handleRetry(pgErr *PostgreSQLError, operation func() err
 			return lastErr
 		}
 	}
-	
+
 	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, lastErr)
 }
 
@@ -127,27 +129,27 @@ func (eh *ErrorHandler) handleTransform(pgErr *PostgreSQLError, mappedCode strin
 	if mapping == nil {
 		return fmt.Errorf("SQLSTATE %s: %s", pgErr.Code, pgErr.Message)
 	}
-	
+
 	message := mapping.TransformMessage
 	if message == "" {
 		message = pgErr.Message
 	}
-	
+
 	// Create transformed error
 	return fmt.Errorf("SQLSTATE %s: %s", mappedCode, message)
 }
 
 // findErrorMapping finds the error mapping for a given code
-func (eh *ErrorHandler) findErrorMapping(errorCode string) *ErrorMapping {
+func (eh *ErrorHandler) findErrorMapping(errorCode string) *config.ErrorMapping {
 	// Check all categories
-	categories := []map[string]ErrorMapping{
+	categories := []map[string]config.ErrorMapping{
 		eh.config.ErrorMappings.TransactionErrors,
 		eh.config.ErrorMappings.ConstraintErrors,
 		eh.config.ErrorMappings.FeatureErrors,
 		eh.config.ErrorMappings.ConnectionErrors,
 		eh.config.ErrorMappings.DataErrors,
 	}
-	
+
 	for _, category := range categories {
 		for _, mapping := range category {
 			for _, code := range mapping.PostgreSQLCodes {
@@ -162,7 +164,7 @@ func (eh *ErrorHandler) findErrorMapping(errorCode string) *ErrorMapping {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -187,47 +189,47 @@ func (tm *TransactionManager) ExecuteInTransaction(ctx context.Context, fn func(
 		if err != nil {
 			return err
 		}
-		
+
 		defer func() {
 			if p := recover(); p != nil {
 				tx.Rollback()
 				panic(p)
 			}
 		}()
-		
+
 		err = fn(tx)
 		if err != nil {
 			tx.Rollback()
 			return err
 		}
-		
+
 		return tx.Commit()
 	}
-	
+
 	err := operation()
 	if err != nil {
 		// Handle error with retry logic if applicable
 		return tm.errorHandler.HandleError(err, "postgresql", operation)
 	}
-	
+
 	return nil
 }
 
 // Example usage of error handling in practice
-func ExampleErrorHandling(config *Config) {
+func ExampleErrorHandling(config *config.Config) {
 	// Create error handler
 	errorHandler := NewErrorHandler(config)
-	
+
 	// Database connection
 	db, err := sql.Open("postgres", "host=localhost port=5432 user=postgres dbname=test sslmode=disable")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	
+
 	// Transaction manager with retry logic
 	txManager := NewTransactionManager(errorHandler, db)
-	
+
 	// Execute a transaction that might encounter deadlocks
 	err = txManager.ExecuteInTransaction(context.Background(), func(tx *sql.Tx) error {
 		// Simulate operations that might deadlock
@@ -235,15 +237,15 @@ func ExampleErrorHandling(config *Config) {
 		if err != nil {
 			return err
 		}
-		
+
 		_, err = tx.Exec("UPDATE accounts SET balance = balance + 100 WHERE id = 2")
 		if err != nil {
 			return err
 		}
-		
+
 		return nil
 	})
-	
+
 	if err != nil {
 		log.Printf("Transaction failed: %v", err)
 	} else {

@@ -1,9 +1,11 @@
-package main
+package log
 
 import (
 	"encoding/hex"
 	"log"
 	"net"
+
+	"github.com/qvad/twinkly/pkg/config"
 )
 
 // loggingConn wraps a net.Conn and dumps all bytes written when enabled.
@@ -23,9 +25,9 @@ func (l *loggingConn) Write(b []byte) (int, error) {
 	return l.Conn.Write(b)
 }
 
-// wrapConn returns a connection that logs all writes when cfg.Debug.DumpNetwork is true.
+// WrapConn returns a connection that logs all writes when cfg.Debug.DumpNetwork is true.
 // It is idempotent: if the provided conn is already a loggingConn, it will not wrap again.
-func wrapConn(c net.Conn, name string, cfg *Config) net.Conn {
+func WrapConn(c net.Conn, name string, cfg *config.Config) net.Conn {
 	if cfg != nil && cfg.Debug.DumpNetwork {
 		if lc, ok := c.(*loggingConn); ok {
 			// Update label/flags if needed, avoid double wrapping

@@ -1,4 +1,4 @@
-package main
+package reporter
 
 import (
 	"encoding/json"
@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/qvad/twinkly/pkg/config"
 )
 
 // InconsistencyType represents different types of inconsistencies
@@ -59,7 +61,7 @@ type DatabaseInfo struct {
 	User     string `json:"user"`
 }
 
-// InconsistencyReporter handles reporting of database inconsistencies
+// InconsistencyReporter handles reporting of inconsistencies
 type InconsistencyReporter struct {
 	mu              sync.Mutex
 	reports         []InconsistencyReport
@@ -72,7 +74,7 @@ type InconsistencyReporter struct {
 	reportToFile    bool
 	reportToWebhook bool
 	webhookURL      string
-	cfg             *Config
+	cfg             *config.Config
 }
 
 // NewInconsistencyReporter creates a new reporter
@@ -90,7 +92,7 @@ func NewInconsistencyReporter() *InconsistencyReporter {
 }
 
 // AttachConfig provides configuration to enrich reports with database metadata.
-func (r *InconsistencyReporter) AttachConfig(cfg *Config) {
+func (r *InconsistencyReporter) AttachConfig(cfg *config.Config) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cfg = cfg

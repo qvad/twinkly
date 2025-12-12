@@ -1,30 +1,28 @@
-package main
+package proxy
 
 import (
-	"context"
-	"database/sql"
-	"fmt"
+	"net"
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/qvad/twinkly/pkg/config"
 )
 
 const (
 	// Test configuration
-	proxyPort     = 5431
-	postgresPort  = 5432
-	yugabytePort  = 5433
-	testDatabase  = "test"
-	testUser      = "postgres"
-	testPassword  = ""
+	proxyPort    = 5431
+	postgresPort = 5432
+	yugabytePort = 5433
+	testDatabase = "test"
+	testUser     = "postgres"
+	testPassword = ""
 )
 
 // TestConfig holds test database configuration
 type TestConfig struct {
-	Name     string
-	Port     int
-	Direct   bool // true = direct connection, false = through proxy
+	Name   string
+	Port   int
+	Direct bool // true = direct connection, false = through proxy
 }
 
 // getConnectionString builds a PostgreSQL connection string
@@ -33,14 +31,14 @@ func getConnectionString(config TestConfig) string {
 	if !config.Direct {
 		port = proxyPort
 	}
-	
+
 	connStr := fmt.Sprintf("host=localhost port=%d user=%s dbname=%s sslmode=disable",
 		port, testUser, testDatabase)
-	
+
 	if testPassword != "" {
 		connStr += fmt.Sprintf(" password=%s", testPassword)
 	}
-	
+
 	return connStr
 }
 
@@ -53,7 +51,7 @@ func TestBasicConnectivity(t *testing.T) {
 		// {Name: "YugabyteDB-Direct", Port: yugabytePort, Direct: true},
 		// {Name: "YugabyteDB-Proxy", Port: yugabytePort, Direct: false},
 	}
-	
+
 	for _, config := range configs {
 		t.Run(config.Name, func(t *testing.T) {
 			connStr := getConnectionString(config)
@@ -63,14 +61,14 @@ func TestBasicConnectivity(t *testing.T) {
 				return
 			}
 			defer db.Close()
-			
+
 			// Test ping
 			err = db.Ping()
 			if err != nil {
 				t.Skipf("Database not available for %s: %v", config.Name, err)
 				return
 			}
-			
+
 			// Test simple query
 			var result int
 			err = db.QueryRow("SELECT 1").Scan(&result)
@@ -78,11 +76,11 @@ func TestBasicConnectivity(t *testing.T) {
 				t.Errorf("Failed to execute simple query: %v", err)
 				return
 			}
-			
+
 			if result != 1 {
 				t.Errorf("Expected 1, got %d", result)
 			}
-			
+
 			t.Logf("%s: Connection successful", config.Name)
 		})
 	}
@@ -93,7 +91,7 @@ func TestQueryExecution(t *testing.T) {
 	configs := []TestConfig{
 		{Name: "PostgreSQL-Proxy", Port: postgresPort, Direct: false},
 	}
-	
+
 	queries := []struct {
 		name  string
 		query string
@@ -155,7 +153,7 @@ func TestQueryExecution(t *testing.T) {
 			},
 		},
 	}
-	
+
 	for _, config := range configs {
 		t.Run(config.Name, func(t *testing.T) {
 			connStr := getConnectionString(config)
@@ -165,12 +163,12 @@ func TestQueryExecution(t *testing.T) {
 				return
 			}
 			defer db.Close()
-			
+
 			if err := db.Ping(); err != nil {
 				t.Skipf("Database not available: %v", err)
 				return
 			}
-			
+
 			for _, q := range queries {
 				t.Run(q.name, func(t *testing.T) {
 					rows, err := db.Query(q.query)
@@ -179,7 +177,7 @@ func TestQueryExecution(t *testing.T) {
 						return
 					}
 					defer rows.Close()
-					
+
 					q.check(t, rows)
 				})
 			}
@@ -192,7 +190,7 @@ func TestPreparedStatements(t *testing.T) {
 	configs := []TestConfig{
 		{Name: "PostgreSQL-Proxy", Port: postgresPort, Direct: false},
 	}
-	
+
 	for _, config := range configs {
 		t.Run(config.Name, func(t *testing.T) {
 			connStr := getConnectionString(config)
@@ -202,12 +200,12 @@ func TestPreparedStatements(t *testing.T) {
 				return
 			}
 			defer db.Close()
-			
+
 			if err := db.Ping(); err != nil {
 				t.Skipf("Database not available: %v", err)
 				return
 			}
-			
+
 			// Test simple prepared statement
 			stmt, err := db.Prepare("SELECT $1::int + $2::int")
 			if err != nil {
@@ -215,18 +213,18 @@ func TestPreparedStatements(t *testing.T) {
 				return
 			}
 			defer stmt.Close()
-			
+
 			var result int
 			err = stmt.QueryRow(10, 32).Scan(&result)
 			if err != nil {
 				t.Errorf("QueryRow failed: %v", err)
 				return
 			}
-			
+
 			if result != 42 {
 				t.Errorf("Expected 42, got %d", result)
 			}
-			
+
 			// Test catalog query as prepared statement (this is what SQLancer does)
 			stmt2, err := db.Prepare("SELECT opcname FROM pg_opclass WHERE opcname = $1")
 			if err != nil {
@@ -234,7 +232,7 @@ func TestPreparedStatements(t *testing.T) {
 				return
 			}
 			defer stmt2.Close()
-			
+
 			var opcname string
 			err = stmt2.QueryRow("array_ops").Scan(&opcname)
 			if err != nil {
@@ -245,7 +243,7 @@ func TestPreparedStatements(t *testing.T) {
 				}
 				return
 			}
-			
+
 			if opcname != "array_ops" {
 				t.Errorf("Expected 'array_ops', got '%s'", opcname)
 			}
@@ -258,7 +256,7 @@ func TestTransactions(t *testing.T) {
 	configs := []TestConfig{
 		{Name: "PostgreSQL-Proxy", Port: postgresPort, Direct: false},
 	}
-	
+
 	for _, config := range configs {
 		t.Run(config.Name, func(t *testing.T) {
 			connStr := getConnectionString(config)
@@ -268,19 +266,19 @@ func TestTransactions(t *testing.T) {
 				return
 			}
 			defer db.Close()
-			
+
 			if err := db.Ping(); err != nil {
 				t.Skipf("Database not available: %v", err)
 				return
 			}
-			
+
 			// Start transaction
 			tx, err := db.Begin()
 			if err != nil {
 				t.Errorf("Begin transaction failed: %v", err)
 				return
 			}
-			
+
 			// Execute query in transaction
 			var result int
 			err = tx.QueryRow("SELECT 1").Scan(&result)
@@ -289,14 +287,14 @@ func TestTransactions(t *testing.T) {
 				tx.Rollback()
 				return
 			}
-			
+
 			// Commit transaction
 			err = tx.Commit()
 			if err != nil {
 				t.Errorf("Commit failed: %v", err)
 				return
 			}
-			
+
 			t.Log("Transaction completed successfully")
 		})
 	}
@@ -307,11 +305,11 @@ func TestConcurrentConnections(t *testing.T) {
 	configs := []TestConfig{
 		{Name: "PostgreSQL-Proxy", Port: postgresPort, Direct: false},
 	}
-	
+
 	for _, config := range configs {
 		t.Run(config.Name, func(t *testing.T) {
 			connStr := getConnectionString(config)
-			
+
 			// Test opening multiple connections
 			connections := make([]*sql.DB, 5)
 			for i := range connections {
@@ -322,13 +320,13 @@ func TestConcurrentConnections(t *testing.T) {
 				}
 				connections[i] = db
 				defer db.Close()
-				
+
 				if err := db.Ping(); err != nil {
 					t.Skipf("Database not available: %v", err)
 					return
 				}
 			}
-			
+
 			// Execute queries on all connections concurrently
 			done := make(chan bool, len(connections))
 			for i, db := range connections {
@@ -345,7 +343,7 @@ func TestConcurrentConnections(t *testing.T) {
 					done <- true
 				}(i, db)
 			}
-			
+
 			// Wait for all goroutines
 			for i := 0; i < len(connections); i++ {
 				<-done
@@ -362,10 +360,10 @@ func isProxyRunning() bool {
 		return false
 	}
 	defer conn.Close()
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	
+
 	err = conn.PingContext(ctx)
 	return err == nil
 }

@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"context"
@@ -12,11 +12,13 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/qvad/twinkly/pkg/comparator"
+	"github.com/qvad/twinkly/pkg/config"
 )
 
 // DualDatabaseResolver handles connections and query comparison
 type DualDatabaseResolver struct {
-	config *Config
+	config *config.Config
 	pgAddr string
 	ybAddr string
 
@@ -30,7 +32,7 @@ type DualDatabaseResolver struct {
 }
 
 // NewDualDatabaseResolver creates a new resolver with comparison capabilities
-func NewDualDatabaseResolver(config *Config, pgAddr, ybAddr string) *DualDatabaseResolver {
+func NewDualDatabaseResolver(config *config.Config, pgAddr, ybAddr string) *DualDatabaseResolver {
 	return &DualDatabaseResolver{
 		config:   config,
 		pgAddr:   pgAddr,
@@ -534,7 +536,7 @@ func convertToString(val interface{}) string {
 
 // ApplyValidationResult applies the result from advanced validation
 // ApplyValidationResult is deprecated - validation moved to dual_proxy.go
-func (r *QueryComparisonResult) ApplyValidationResult(validation *ValidationResult) {
+func (r *QueryComparisonResult) ApplyValidationResult(validation *comparator.ValidationResult) {
 	// This functionality has been moved to dual_proxy.go for better integration
 	log.Printf("Warning: ApplyValidationResult is deprecated")
 }

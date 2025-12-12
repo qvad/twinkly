@@ -1,4 +1,4 @@
-package main
+package comparator
 
 import (
 	"fmt"
@@ -6,7 +6,11 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+
+	"github.com/qvad/twinkly/pkg/protocol"
 )
+
+const MaxRowsToSort = 10000
 
 // ResultValidator validates and compares query results between databases
 type ResultValidator struct {
@@ -31,8 +35,8 @@ func NewResultValidator(failOnDifferences bool, sortBeforeCompare bool) *ResultV
 }
 
 // sortDataRowsLex returns a new slice of DataRow messages sorted by raw Data lexicographically
-func sortDataRowsLex(rows []*PGMessage) []*PGMessage {
-	copyRows := make([]*PGMessage, len(rows))
+func sortDataRowsLex(rows []*protocol.PGMessage) []*protocol.PGMessage {
+	copyRows := make([]*protocol.PGMessage, len(rows))
 	copy(copyRows, rows)
 	sort.Slice(copyRows, func(i, j int) bool {
 		return string(copyRows[i].Data) < string(copyRows[j].Data)
@@ -41,7 +45,7 @@ func sortDataRowsLex(rows []*PGMessage) []*PGMessage {
 }
 
 // ValidateResults compares results from PostgreSQL and YugabyteDB
-func (rv *ResultValidator) ValidateResults(pgResults, ybResults []*PGMessage) (*ValidationResult, error) {
+func (rv *ResultValidator) ValidateResults(pgResults, ybResults []*protocol.PGMessage) (*ValidationResult, error) {
 	result := &ValidationResult{
 		AreEqual:   true,
 		ShouldFail: false,
@@ -53,8 +57,12 @@ func (rv *ResultValidator) ValidateResults(pgResults, ybResults []*PGMessage) (*
 
 	// Optionally sort rows before comparing to ignore ordering differences
 	if rv.SortBeforeCompare {
-		pgDataRows = sortDataRowsLex(pgDataRows)
-		ybDataRows = sortDataRowsLex(ybDataRows)
+		if len(pgDataRows) > MaxRowsToSort || len(ybDataRows) > MaxRowsToSort {
+			log.Printf("⚠️  Skipping SortBeforeCompare: Result set too large (>%d rows). Comparison will be order-sensitive.", MaxRowsToSort)
+		} else {
+			pgDataRows = sortDataRowsLex(pgDataRows)
+			ybDataRows = sortDataRowsLex(ybDataRows)
+		}
 	}
 
 	// Compare row counts
@@ -94,7 +102,7 @@ func (rv *ResultValidator) ValidateResults(pgResults, ybResults []*PGMessage) (*
 }
 
 // compareDataRows compares two data row messages
-func (rv *ResultValidator) compareDataRows(pgRow, ybRow *PGMessage) bool {
+func (rv *ResultValidator) compareDataRows(pgRow, ybRow *protocol.PGMessage) bool {
 	if pgRow == nil && ybRow == nil {
 		return true
 	}
@@ -104,6 +112,17 @@ func (rv *ResultValidator) compareDataRows(pgRow, ybRow *PGMessage) bool {
 
 	// Compare the raw data
 	return reflect.DeepEqual(pgRow.Data, ybRow.Data)
+}
+
+// extractDataRows extracts DataRow messages from a list of protocol messages
+func extractDataRows(messages []*protocol.PGMessage) []*protocol.PGMessage {
+	var dataRows []*protocol.PGMessage
+	for _, msg := range messages {
+		if msg.Type == protocol.MsgTypeDataRow {
+			dataRows = append(dataRows, msg)
+		}
+	}
+	return dataRows
 }
 
 // CreateFailureError creates an SQL error for result differences

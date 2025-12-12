@@ -1,6 +1,10 @@
-package main
+package comparator
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/qvad/twinkly/pkg/config"
+)
 
 func TestChooseExplainClause_DefaultsAndConfig(t *testing.T) {
 	// Defaults when no config provided

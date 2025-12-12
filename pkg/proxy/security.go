@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"errors"
@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/qvad/twinkly/pkg/config"
 )
 
 // SecurityConfig holds security-related configuration
@@ -274,7 +276,7 @@ func SanitizeString(input string) string {
 }
 
 // ValidateConfigSecurity validates security-related configuration
-func ValidateConfigSecurity(config *Config) error {
+func ValidateConfigSecurity(config *config.Config) error {
 	// Check for hardcoded credentials (basic check)
 	pgConnStr := fmt.Sprintf("host=%s port=%d", config.Proxy.PostgreSQL.Host, config.Proxy.PostgreSQL.Port)
 	if strings.Contains(strings.ToLower(pgConnStr), "password=") {

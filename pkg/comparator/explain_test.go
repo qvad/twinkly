@@ -1,8 +1,9 @@
-package main
+package comparator
 
 import (
-	"strings"
 	"testing"
+
+	"github.com/qvad/twinkly/pkg/config"
 )
 
 // TestExplainAnalyzeConfiguration tests the new EXPLAIN ANALYZE configuration

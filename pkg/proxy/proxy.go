@@ -1,4 +1,4 @@
-package main
+package proxy
 
 import (
 	"fmt"
@@ -6,22 +6,25 @@ import (
 	"net"
 	"strings"
 	"sync"
+
+	"github.com/qvad/twinkly/pkg/config"
+	"github.com/qvad/twinkly/pkg/reporter"
 )
 
 // SimpleProxy implements a basic PostgreSQL proxy without pgbroker dependency
 type SimpleProxy struct {
-	config   *Config
+	config   *config.Config
 	resolver *DualDatabaseResolver
 	listener net.Listener
 	shutdown chan struct{}
 	wg       sync.WaitGroup
-	reporter *InconsistencyReporter
+	reporter *reporter.InconsistencyReporter
 	mu       sync.Mutex
 }
 
 // NewSimpleProxy creates a new proxy instance
-func NewSimpleProxy(config *Config) *SimpleProxy {
-	rep := NewInconsistencyReporter()
+func NewSimpleProxy(config *config.Config) *SimpleProxy {
+	rep := reporter.NewInconsistencyReporter()
 	rep.AttachConfig(config)
 	return &SimpleProxy{
 		config:   config,

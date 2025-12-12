@@ -1,53 +1,70 @@
-# yb-twinkly Architecture Overview
+# Architecture
 
-This project is a dual-execution PostgreSQL protocol proxy that connects to both PostgreSQL and YugabyteDB, routes client traffic, and can compare results to detect incompatibilities.
+This document outlines the proposed architecture for the refactored twinkly project.
 
-This refactor introduces a light-weight structure without changing behavior, by splitting large files into cohesive units within the same package.
+## Project Structure
 
-## Package layout (package main)
+The project will be restructured into the following directory layout:
 
-- main.go, tool_demo.go
-  - Entrypoints and CLI/demo wiring.
-- config.go
-  - Configuration parsing and typed configuration model.
-- proxy.go
-  - SimpleProxy server lifecycle (listen/accept/shutdown) and shared reporter.
-- dual_proxy.go
-  - Core DualExecutionProxy: connection startup, query loop, routing, TLS negotiation, utility predicates (isReadOnlyQuery, DDL/DML detection, txn markers) and error parsing.
-- dual_proxy_messages.go
-  - Extended-protocol message handling for non-query messages (Parse/Bind/Execute/Flush/Sync). Avoids blocking reads except after Sync.
-- dual_proxy_helpers.go
-  - Small helpers used by DualExecutionProxy (collecting results, extracting rows, transport error detector, reporter accessor).
-- dual_resolver.go
-  - Backend connection pools and admin ops used for background comparisons and DDL mirroring.
-- result_validator.go
-  - Row/command-result comparison logic and summary structs.
-- slow_query_analyzer*.go
-  - Performance comparison helpers and tests.
-- constraint_divergence_detector.go
-  - Detects and reports constraint handling divergences.
-- error_handler.go, security.go, netlog.go, pgproto.go
-  - Supporting utilities (error mapping, security checks, network logging, PG protocol bits).
+```
+/
+├── cmd/
+│   └── twinkly/
+│       └── main.go
+├── pkg/
+│   ├── proxy/
+│   │   ├── dual_proxy.go
+│   │   ├── proxy.go
+│   │   └── ...
+│   ├── config/
+│   │   ├── config.go
+│   │   └── ...
+│   ├── comparator/
+│   │   ├── comparator.go
+│   │   └── ...
+│   └── ...
+├── internal/
+│   └── ...
+├── go.mod
+├── go.sum
+└── ...
+```
 
-## Design guidelines
+- **`cmd/`**: This directory will contain the entry point of the application.
+- **`pkg/`**: This directory will contain reusable packages that can be shared with other applications.
+- **`internal/`**: This directory will contain packages that are specific to the twinkly project and should not be imported by other applications.
 
-- Keep DualExecutionProxy minimal: prefer extracting narrowly-scoped helpers to dual_proxy_helpers.go.
-- Don’t block on backend reads for extended protocol until Sync to avoid deadlocks.
-- Keep package `main` until a broader module refactor is warranted; tests depend on current imports.
-- Prefer small files per concern; functions should be easy to navigate via file names.
+## Components
 
-## Future improvements (non-breaking)
+The application will be composed of the following main components:
 
-- Consider moving configuration load/validation into a subpackage (config/) if tests allow.
-- Extract protocol types and helpers (pgproto.go) into a subpackage.
-- Introduce context-aware logging and structured fields.
-- Add integration diagram to this doc illustrating data flow through proxy and comparators.
+- **Proxy**: The proxy component will be responsible for listening for incoming connections and forwarding them to the appropriate database.
+- **Config**: The config component will be responsible for loading and validating the application's configuration.
+- **Comparator**: The comparator component will be responsible for comparing the results from the two databases.
+- **Reporter**: The reporter component will be responsible for reporting any inconsistencies found between the two databases.
+- **Cache**: The cache component will be responsible for caching the results of frequently executed queries.
+- **Connection Pool**: The connection pool component will be responsible for managing database connections.
 
+## Workflow
 
-## Inconsistency report format update
+The following diagram illustrates the workflow of the application:
 
-In addition to query and result summaries, each report now includes endpoint metadata for both databases:
-- postgresql_info: { name, host, port, database, user }
-- yugabytedb_info: { name, host, port, database, user }
+```
+[Client] -> [Proxy] -> [Connection Pool] -> [PostgreSQL]
+                  |
+                  -> [Connection Pool] -> [YugabyteDB]
+                  |
+                  -> [Comparator] -> [Reporter]
+                  |
+                  -> [Cache]
+```
 
-These fields help operators quickly identify which endpoints produced the divergent results.
+1. The client connects to the proxy.
+2. The proxy gets two connections from the connection pool, one for PostgreSQL and one for YugabyteDB.
+3. The proxy sends the client's query to both databases.
+4. The proxy receives the results from both databases.
+5. The proxy sends the results to the comparator.
+6. The comparator compares the results and sends a report to the reporter if there are any inconsistencies.
+7. The proxy sends the results from the source of truth database to the client.
+8. The proxy caches the results if caching is enabled.
+9. The proxy returns the connections to the connection pool.

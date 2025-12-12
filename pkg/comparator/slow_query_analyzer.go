@@ -1,18 +1,24 @@
-package main
+package comparator
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/qvad/twinkly/pkg/ai"
+	"github.com/qvad/twinkly/pkg/config"
 )
 
 // SlowQueryAnalyzer analyzes query performance differences between databases
 type SlowQueryAnalyzer struct {
-	config             *Config
+	config             *config.Config
 	pgPool             *sql.DB
 	ybPool             *sql.DB
+	aiAgent            ai.AIAgent
 	slowQueryThreshold float64 // Ratio threshold (e.g., 4.0 means 4x slower)
 	failOnSlowQueries  bool    // Whether to fail queries that are too slow
 }
@@ -27,19 +33,28 @@ type SlowQueryResult struct {
 	YugabyteDBPlan string
 	IsSlowQuery    bool
 	ShouldFail     bool
+	AIAnalysis     *ai.AnalysisResponse // Result from AI agent
 }
 
 // NewSlowQueryAnalyzer creates a new slow query analyzer
-func NewSlowQueryAnalyzer(config *Config, pgPool, ybPool *sql.DB) *SlowQueryAnalyzer {
+func NewSlowQueryAnalyzer(config *config.Config, pgPool, ybPool *sql.DB) *SlowQueryAnalyzer {
 	threshold := 4.0 // Default: fail if YB is 4x slower than PG
 	if config.Comparison.SlowQueryRatio > 0 {
 		threshold = config.Comparison.SlowQueryRatio
+	}
+
+	// Initialize AI agent based on config (currently supports mock)
+	var agent ai.AIAgent
+	if config.Comparison.AI.Enabled {
+		// TODO: Switch on provider type when real implementations exist
+		agent = ai.NewMockAIAgent()
 	}
 
 	return &SlowQueryAnalyzer{
 		config:             config,
 		pgPool:             pgPool,
 		ybPool:             ybPool,
+		aiAgent:            agent,
 		slowQueryThreshold: threshold,
 		failOnSlowQueries:  config.Comparison.FailOnSlowQueries,
 	}
@@ -56,15 +71,33 @@ func (s *SlowQueryAnalyzer) AnalyzeQuery(query string) (*SlowQueryResult, error)
 		Query: query,
 	}
 
+	var wg sync.WaitGroup
+	var pgPlan, ybPlan string
+	var pgErr, ybErr error
+	var pgDuration, ybDuration time.Duration
+
+	wg.Add(2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Execute on PostgreSQL with timing
-	pgStart := time.Now()
-	pgPlan, pgErr := s.getExplainPlan(s.pgPool, query)
-	pgDuration := time.Since(pgStart)
+	go func() {
+		defer wg.Done()
+		start := time.Now()
+		pgPlan, pgErr = s.getExplainPlan(ctx, s.pgPool, query, "postgresql")
+		pgDuration = time.Since(start)
+	}()
 
 	// Execute on YugabyteDB with timing
-	ybStart := time.Now()
-	ybPlan, ybErr := s.getExplainPlan(s.ybPool, query)
-	ybDuration := time.Since(ybStart)
+	go func() {
+		defer wg.Done()
+		start := time.Now()
+		ybPlan, ybErr = s.getExplainPlan(ctx, s.ybPool, query, "yugabytedb")
+		ybDuration = time.Since(start)
+	}()
+
+	wg.Wait()
 
 	result.PostgreSQLTime = pgDuration
 	result.YugabyteDBTime = ybDuration
@@ -80,15 +113,42 @@ func (s *SlowQueryAnalyzer) AnalyzeQuery(query string) (*SlowQueryResult, error)
 	result.IsSlowQuery = result.SlowRatio > s.slowQueryThreshold
 	result.ShouldFail = result.IsSlowQuery && s.failOnSlowQueries
 
+	// AI Analysis Trigger
+	if result.IsSlowQuery && s.aiAgent != nil {
+		// Run AI analysis asynchronously to avoid blocking the response
+		go func() {
+			ctxAI, cancelAI := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelAI()
+
+			req := ai.AnalysisRequest{
+				Query:           query,
+				DiscrepancyType: "Performance",
+				PostgreSQL: ai.BackendData{
+					ExecutionTime: pgDuration,
+					Plan:          pgPlan,
+				},
+				YugabyteDB: ai.BackendData{
+					ExecutionTime: ybDuration,
+					Plan:          ybPlan,
+				},
+				AdditionalInfo: []string{fmt.Sprintf("Slow Ratio: %.2fx", result.SlowRatio)},
+			}
+
+			resp, err := s.aiAgent.AnalyzeDiscrepancy(ctxAI, req)
+			if err != nil {
+				log.Printf("❌ AI Analysis failed: %v", err)
+			} else {
+				log.Printf("🤖 AI Analysis for slow query:\n%s\nRecommendation: %s", resp.Analysis, resp.Recommendation)
+			}
+		}()
+	}
+
 	// Log slow queries
 	if result.IsSlowQuery {
 		log.Printf("🐌 SLOW QUERY DETECTED: YugabyteDB is %.2fx slower than PostgreSQL", result.SlowRatio)
 		log.Printf("Query: %s", query)
 		log.Printf("PostgreSQL: %v, YugabyteDB: %v", pgDuration, ybDuration)
 	}
-
-	// Do not fail on slow queries; caller will report performance issues as consistency reports
-	// Previously, this returned an error when ShouldFail was true. Now, we only return execution errors below.
 
 	// Check for execution errors
 	if pgErr != nil {
@@ -101,31 +161,44 @@ func (s *SlowQueryAnalyzer) AnalyzeQuery(query string) (*SlowQueryResult, error)
 	return result, nil
 }
 
-// chooseExplainClause selects the appropriate EXPLAIN clause based on query type and config
-func chooseExplainClause(cfg *Config, query string) string {
+// chooseExplainClause selects the appropriate EXPLAIN clause based on DB type and query type
+func chooseExplainClause(cfg *config.Config, query string, dbType string) string {
 	s := strings.TrimSpace(strings.ToLower(query))
-	// Determine defaults if config not provided or fields empty
-	selectClause := "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)"
-	otherClause := "EXPLAIN (FORMAT TEXT)"
+	isSelect := strings.HasPrefix(s, "select") || strings.HasPrefix(s, "with")
+
+	// Default clauses
+	pgClause := "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)"
+	// ybClause is currently unused as we have specific logic below
+	// ybClause := "EXPLAIN (ANALYZE, DIST, FORMAT TEXT)"
+
 	if cfg != nil {
-		if cfg.Comparison.ExplainSelect != "" {
-			selectClause = cfg.Comparison.ExplainSelect
-		}
-		if cfg.Comparison.ExplainOther != "" {
-			otherClause = cfg.Comparison.ExplainOther
+		// Use configured generic clauses if specific ones aren't fully implemented yet
+		// For now, we hardcode the YB distinction requested by the user
+		if dbType == "yugabytedb" {
+			if isSelect {
+				return "EXPLAIN (ANALYZE, DIST)"
+			}
+			return "EXPLAIN (DIST)"
+		} else {
+			// PostgreSQL
+			if cfg.Comparison.ExplainSelect != "" && isSelect {
+				return cfg.Comparison.ExplainSelect
+			}
+			if cfg.Comparison.ExplainOther != "" && !isSelect {
+				return cfg.Comparison.ExplainOther
+			}
+			return pgClause
 		}
 	}
-	if strings.HasPrefix(s, "select") || strings.HasPrefix(s, "with") {
-		return selectClause
-	}
-	return otherClause
+	return pgClause
 }
 
 // getExplainPlan gets EXPLAIN/EXPLAIN ANALYZE output for a query using config
-func (s *SlowQueryAnalyzer) getExplainPlan(db *sql.DB, query string) (string, error) {
-	clause := chooseExplainClause(s.config, query)
+func (s *SlowQueryAnalyzer) getExplainPlan(ctx context.Context, db *sql.DB, query string, dbType string) (string, error) {
+	clause := chooseExplainClause(s.config, query, dbType)
 	explainQuery := fmt.Sprintf("%s %s", clause, query)
-	rows, err := db.Query(explainQuery)
+
+	rows, err := db.QueryContext(ctx, explainQuery)
 	if err != nil {
 		return "", fmt.Errorf("failed to execute %s: %v", clause, err)
 	}

@@ -1,4 +1,4 @@
-package main
+package comparator
 
 import (
 	"log"
@@ -29,21 +29,21 @@ type ConstraintViolationError struct {
 
 // DatabaseBehaviorDivergence represents when databases behave differently
 type DatabaseBehaviorDivergence struct {
-	Query              string
-	PostgreSQLResult   *QueryExecutionResult
-	YugabyteDBResult   *QueryExecutionResult
-	DivergenceType     string
-	CriticalityLevel   string
-	RecommendedAction  string
+	Query             string
+	PostgreSQLResult  *QueryExecutionResult
+	YugabyteDBResult  *QueryExecutionResult
+	DivergenceType    string
+	CriticalityLevel  string
+	RecommendedAction string
 }
 
 // QueryExecutionResult represents the result of executing a query on a database
 type QueryExecutionResult struct {
-	Success          bool
-	Error            error
-	ConstraintError  *ConstraintViolationError
-	AffectedRows     int64
-	DatabaseName     string
+	Success         bool
+	Error           error
+	ConstraintError *ConstraintViolationError
+	AffectedRows    int64
+	DatabaseName    string
 }
 
 // ConstraintDivergenceDetector detects when databases handle constraints differently
@@ -230,7 +230,7 @@ func (d *ConstraintDivergenceDetector) extractConstraintName(errorMsg, constrain
 	// Try to extract constraint name from error message
 	// This is a simplified implementation - real implementation would need
 	// more sophisticated parsing for different PostgreSQL/YugabyteDB error formats
-	
+
 	// This is a simplified regex - in real implementation, use proper regex
 	if strings.Contains(errorMsg, `"`) {
 		start := strings.Index(errorMsg, `"`)
