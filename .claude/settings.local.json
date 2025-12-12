@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(rm:*)",
+      "Bash(docker-compose -f docker-compose.test.yml ps)",
+      "Bash(docker-compose:*)",
+      "Bash(docker system prune:*)",
+      "Bash(docker logs:*)",
+      "Bash(POSTGRES_HOST=localhost go test -v ./test/integration/ -run TestPostgreSQLOnly)",
+      "Bash(mv:*)",
+      "Bash(psql:*)",
+      "Bash(PGPASSWORD=testpass psql:*)",
+      "Bash(docker exec:*)",
+      "Bash(docker run:*)",
+      "Bash(docker build:*)",
+      "Bash(make:*)"
+    ],
+    "deny": []
+  }
+}
