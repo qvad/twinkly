@@ -1,11 +1,13 @@
 package proxy
 
 import (
-	"net"
+	"context"
+	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/qvad/twinkly/pkg/config"
+	_ "github.com/lib/pq"
 )
 
 const (

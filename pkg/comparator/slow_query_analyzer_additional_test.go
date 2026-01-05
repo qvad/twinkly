@@ -7,22 +7,23 @@ import (
 )
 
 func TestChooseExplainClause_DefaultsAndConfig(t *testing.T) {
-	// Defaults when no config provided
-	if got := chooseExplainClause(nil, "select 1"); got == "" || got == "EXPLAIN (FORMAT TEXT)" {
-		t.Errorf("expected ANALYZE default for SELECT, got %q", got)
+	// When cfg is nil, always returns pgClause default regardless of query type
+	defaultClause := "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)"
+	if got := chooseExplainClause(nil, "select 1", "postgresql"); got != defaultClause {
+		t.Errorf("expected default clause for SELECT with nil cfg, got %q", got)
 	}
-	if got := chooseExplainClause(nil, "update x set a=1"); got != "EXPLAIN (FORMAT TEXT)" {
-		t.Errorf("expected non-ANALYZE default for non-SELECT, got %q", got)
+	if got := chooseExplainClause(nil, "update x set a=1", "postgresql"); got != defaultClause {
+		t.Errorf("expected default clause for non-SELECT with nil cfg, got %q", got)
 	}
 
-	cfg := &Config{}
+	cfg := &config.Config{}
 	cfg.Comparison.ExplainSelect = "EXPLAIN (ANALYZE, COSTS OFF)"
 	cfg.Comparison.ExplainOther = "EXPLAIN (VERBOSE)"
 
-	if got := chooseExplainClause(cfg, "WITH cte AS (SELECT 1) SELECT * FROM cte"); got != cfg.Comparison.ExplainSelect {
+	if got := chooseExplainClause(cfg, "WITH cte AS (SELECT 1) SELECT * FROM cte", "postgresql"); got != cfg.Comparison.ExplainSelect {
 		t.Errorf("custom select clause not applied, got %q", got)
 	}
-	if got := chooseExplainClause(cfg, "insert into t values (1)"); got != cfg.Comparison.ExplainOther {
+	if got := chooseExplainClause(cfg, "insert into t values (1)", "postgresql"); got != cfg.Comparison.ExplainOther {
 		t.Errorf("custom other clause not applied, got %q", got)
 	}
 }
