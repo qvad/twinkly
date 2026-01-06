@@ -22,7 +22,7 @@ import (
 // DualExecutionProxy implements the actual dual-execution logic
 type DualExecutionProxy struct {
 	config                  *config.Config
-	resolver                *DualDatabaseResolver
+	resolver                *SideChannelManager
 	pgAddr                  string
 	ybAddr                  string
 	security                *SecurityConfig
@@ -122,7 +122,7 @@ func (p *DualExecutionProxy) HandleConnection(clientConn net.Conn) {
 	defer ybConn.Close()
 
 	if p.resolver == nil {
-		p.resolver = NewDualDatabaseResolver(p.config, p.pgAddr, p.ybAddr)
+		p.resolver = NewSideChannelManager(p.config, p.pgAddr, p.ybAddr)
 	}
 	if p.config.Comparison.ReportSlowQueries {
 		pgPool, ybPool := p.resolver.GetPools()
@@ -441,46 +441,6 @@ func (p *DualExecutionProxy) maybeEnableBackendTLS(conn net.Conn, host, name str
 		return tlsConn, nil
 	}
 	return conn, nil
-}
-
-func parseBackendError(data []byte) (severity, code, message string) {
-	// ErrorResponse is a sequence of fields: <type byte><cstring> ... ending with a terminator 0x00
-	i := 0
-	for i < len(data) {
-		if data[i] == 0 { // terminator
-			break
-		}
-		fieldType := data[i]
-		i++
-		// read cstring
-		start := i
-		for i < len(data) && data[i] != 0 {
-			i++
-		}
-		val := ""
-		if start <= len(data) {
-			val = string(data[start:i])
-		}
-		// skip null terminator if present
-		if i < len(data) && data[i] == 0 {
-			i++
-		}
-		switch fieldType {
-		case 'S': // Severity (localized)
-			if severity == "" {
-				severity = val
-			}
-		case 'V': // Severity (non-localized)
-			if severity == "" {
-				severity = val
-			}
-		case 'C':
-			code = val
-		case 'M':
-			message = val
-		}
-	}
-	return
 }
 
 // Helpers

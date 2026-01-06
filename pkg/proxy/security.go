@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/qvad/twinkly/pkg/config"
 )
@@ -124,103 +123,6 @@ func (sc *SecurityConfig) CompilePatterns() error {
 			return fmt.Errorf("invalid blocked pattern %s: %w", pattern, err)
 		}
 		sc.blockedRegex = append(sc.blockedRegex, re)
-	}
-
-	return nil
-}
-
-// ValidateQuery validates a SQL query for security issues
-func (sc *SecurityConfig) ValidateQuery(query string) error {
-	// Basic length check
-	if len(query) > sc.MaxQueryLength {
-		return fmt.Errorf("query too long: %d bytes (max %d)", len(query), sc.MaxQueryLength)
-	}
-
-	// UTF-8 validation
-	if !utf8.ValidString(query) {
-		return errors.New("query contains invalid UTF-8 sequences")
-	}
-
-	// Normalize query for analysis
-	normalizedQuery := strings.TrimSpace(query)
-	if normalizedQuery == "" {
-		return errors.New("empty query")
-	}
-
-	// Check against blocked patterns first
-	for i, re := range sc.blockedRegex {
-		if re.MatchString(normalizedQuery) {
-			return fmt.Errorf("query matches blocked pattern %d: %s", i, sc.BlockedPatterns[i])
-		}
-	}
-
-	// Check if query matches any allowed pattern
-	if len(sc.allowedRegex) > 0 {
-		allowed := false
-		for _, re := range sc.allowedRegex {
-			if re.MatchString(normalizedQuery) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return errors.New("query does not match any allowed pattern")
-		}
-	}
-
-	// Additional SQL injection checks
-	if err := sc.checkSQLInjection(normalizedQuery); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// checkSQLInjection performs additional SQL injection detection
-func (sc *SecurityConfig) checkSQLInjection(query string) error {
-	queryLower := strings.ToLower(query)
-
-	// Check for suspicious patterns
-	suspiciousPatterns := []string{
-		"' or 1=1",
-		"'1'='1",
-		"' or ",
-		"'; drop",
-		"'; delete",
-		"'; update",
-		"union select",
-		"0x",
-		"char(",
-		"ascii(",
-		"substring(",
-		"length(",
-		"version(",
-		"user(",
-		"database(",
-		"schema(",
-	}
-
-	for _, pattern := range suspiciousPatterns {
-		if strings.Contains(queryLower, pattern) {
-			return fmt.Errorf("potential SQL injection detected: contains '%s'", pattern)
-		}
-	}
-
-	// Check for excessive quotes or semicolons
-	singleQuotes := strings.Count(query, "'")
-	doubleQuotes := strings.Count(query, "\"")
-	semicolons := strings.Count(query, ";")
-
-	if singleQuotes > 10 {
-		return fmt.Errorf("excessive single quotes detected: %d", singleQuotes)
-	}
-
-	if doubleQuotes > 10 {
-		return fmt.Errorf("excessive double quotes detected: %d", doubleQuotes)
-	}
-
-	if semicolons > 1 {
-		return fmt.Errorf("multiple statements not allowed: %d semicolons", semicolons)
 	}
 
 	return nil

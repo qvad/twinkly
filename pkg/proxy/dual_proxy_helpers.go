@@ -41,22 +41,11 @@ func (p *DualExecutionProxy) collectQueryResults(ctx context.Context, ch <-chan 
 
 			// Capture SQL errors so callers can detect failure vs success
 			if msg.Type == protocol.MsgTypeErrorResponse && firstErr == nil {
-				sev, code, text := parseBackendError(msg.Data)
-				// Build a readable error; include fields when available
-				parts := make([]string, 0, 3)
-				if sev != "" {
-					parts = append(parts, sev)
-				}
-				if code != "" {
-					parts = append(parts, code)
-				}
-				if text != "" {
-					parts = append(parts, text)
-				}
-				if len(parts) == 0 {
-					firstErr = fmt.Errorf("backend returned ErrorResponse")
+				errResp, err := protocol.ParseErrorResponse(msg)
+				if err != nil {
+					firstErr = fmt.Errorf("failed to parse backend error: %v", err)
 				} else {
-					firstErr = fmt.Errorf(strings.Join(parts, " "))
+					firstErr = fmt.Errorf("%s", errResp.String())
 				}
 			}
 

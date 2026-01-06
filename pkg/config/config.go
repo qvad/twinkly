@@ -42,26 +42,18 @@ type DatabaseConfig struct {
 
 // RoutingConfig contains query routing rules
 type RoutingConfig struct {
-	PostgresOnlyPatterns []string
-	YugabyteOnlyPatterns []string
-	DefaultTarget        string
-
-	// Compiled regex patterns for efficiency
-	pgPatterns []*regexp.Regexp
-	ybPatterns []*regexp.Regexp
+	DefaultTarget string
 }
 
 // ComparisonConfig contains result comparison settings
 type ComparisonConfig struct {
-	Enabled             bool
-	SourceOfTruth       string
-	ForceOrderByCompare bool
-	DefaultOrderColumns []string
-	MaxCompareRows      int
-	LogComparisons      bool
-	LogDifferencesOnly  bool
-	FailOnDifferences   bool
-	ExcludePatterns     []string
+	Enabled            bool
+	SourceOfTruth      string
+	MaxCompareRows     int
+	LogComparisons     bool
+	LogDifferencesOnly bool
+	FailOnDifferences  bool
+	ExcludePatterns    []string
 
 	// When false, operate in degraded mode if secondary is unavailable: route only to SourceOfTruth and do not reject queries.
 	// When true, enforce that secondary must be healthy; otherwise reject queries on this connection.
@@ -287,34 +279,11 @@ func LoadConfig(filename string) (*Config, error) {
 	cfg.Proxy.YugabyteDB.ConnectionTimeout = conf.GetDuration("proxy.yugabytedb.connection-timeout")
 
 	// Routing config
-	pgPatterns := conf.GetStringSlice("proxy.routing.postgres-only-patterns")
-	cfg.Proxy.Routing.PostgresOnlyPatterns = make([]string, len(pgPatterns))
-	for i, pattern := range pgPatterns {
-		// Clean up any extra quotes from HOCON parsing
-		cleaned := strings.Trim(pattern, "\"")
-		// Also handle escaped backslashes from HOCON
-		cleaned = strings.ReplaceAll(cleaned, "\\\\", "\\")
-		cfg.Proxy.Routing.PostgresOnlyPatterns[i] = cleaned
-	}
-
-	ybPatterns := conf.GetStringSlice("proxy.routing.yugabyte-only-patterns")
-	cfg.Proxy.Routing.YugabyteOnlyPatterns = make([]string, len(ybPatterns))
-	for i, pattern := range ybPatterns {
-		cfg.Proxy.Routing.YugabyteOnlyPatterns[i] = strings.Trim(pattern, "\"")
-	}
-
 	cfg.Proxy.Routing.DefaultTarget = conf.GetString("proxy.routing.default-target")
-
-	// Compile routing patterns
-	if err := compileRoutingPatterns(&cfg.Proxy.Routing); err != nil {
-		return nil, fmt.Errorf("failed to compile routing patterns: %w", err)
-	}
 
 	// Load comparison config
 	cfg.Comparison.Enabled = conf.GetBoolean("comparison.enabled")
 	cfg.Comparison.SourceOfTruth = conf.GetString("comparison.source-of-truth")
-	cfg.Comparison.ForceOrderByCompare = conf.GetBoolean("comparison.force-order-by-compare")
-	cfg.Comparison.DefaultOrderColumns = conf.GetStringSlice("comparison.default-order-columns")
 	cfg.Comparison.MaxCompareRows = conf.GetInt("comparison.max-compare-rows")
 	cfg.Comparison.LogComparisons = conf.GetBoolean("comparison.log-comparisons")
 	cfg.Comparison.LogDifferencesOnly = conf.GetBoolean("comparison.log-differences-only")
@@ -466,29 +435,6 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// compileRoutingPatterns compiles regex patterns for efficiency
-func compileRoutingPatterns(routing *RoutingConfig) error {
-	for _, pattern := range routing.PostgresOnlyPatterns {
-		// Make patterns case-insensitive
-		re, err := regexp.Compile("(?i)" + pattern)
-		if err != nil {
-			return fmt.Errorf("invalid postgres pattern %s: %w", pattern, err)
-		}
-		routing.pgPatterns = append(routing.pgPatterns, re)
-	}
-
-	for _, pattern := range routing.YugabyteOnlyPatterns {
-		// Make patterns case-insensitive
-		re, err := regexp.Compile("(?i)" + pattern)
-		if err != nil {
-			return fmt.Errorf("invalid yugabyte pattern %s: %w", pattern, err)
-		}
-		routing.ybPatterns = append(routing.ybPatterns, re)
-	}
-
-	return nil
-}
-
 // compileExcludePatterns compiles exclude patterns for comparison
 func compileExcludePatterns(comparison *ComparisonConfig) error {
 	for _, pattern := range comparison.ExcludePatterns {
@@ -574,37 +520,6 @@ func loadErrorCategory(conf *hocon.Config, path string, target map[string]ErrorM
 	}
 }
 
-// ShouldRouteToPostgres checks if query should go to PostgreSQL only
-func (c *Config) ShouldRouteToPostgres(query string) bool {
-	// Check both original and lowercase versions
-	for i, re := range c.Proxy.Routing.pgPatterns {
-		if re.MatchString(query) {
-			if c.Monitoring.LogRoutingDecisions {
-				log.Printf("Routing to PostgreSQL (pattern %d: %s): %s", i, c.Proxy.Routing.PostgresOnlyPatterns[i], query)
-			}
-			return true
-		}
-	}
-
-	return false
-}
-
-// ShouldRouteToYugabyte checks if query should go to YugabyteDB only
-func (c *Config) ShouldRouteToYugabyte(query string) bool {
-	queryLower := strings.ToLower(query)
-
-	for _, re := range c.Proxy.Routing.ybPatterns {
-		if re.MatchString(queryLower) {
-			if c.Monitoring.LogRoutingDecisions {
-				log.Printf("Routing to YugabyteDB: %s", query)
-			}
-			return true
-		}
-	}
-
-	return false
-}
-
 // MapError maps an error code from one database to another
 func (c *Config) MapError(errorCode string, fromDB string) (string, string, bool) {
 	// Check all error categories
@@ -671,50 +586,4 @@ func (c *Config) ShouldCompareQuery(query string) bool {
 	}
 
 	return true
-}
-
-// AddOrderByToQuery adds ORDER BY clause to a query if force_order_by_compare is enabled
-func (c *Config) AddOrderByToQuery(query string) string {
-	if !c.Comparison.ForceOrderByCompare {
-		return query
-	}
-
-	// Check if query already has ORDER BY (simple check)
-	queryUpper := strings.ToUpper(query)
-	if strings.Contains(queryUpper, "ORDER BY") {
-		return query
-	}
-
-	// Only add ORDER BY to SELECT queries
-	if !strings.HasPrefix(strings.TrimSpace(queryUpper), "SELECT") {
-		return query
-	}
-
-	// Find the best column to order by
-	orderColumn := c.findOrderColumn(query)
-	if orderColumn == "" {
-		return query
-	}
-
-	// Add ORDER BY clause
-	return strings.TrimSuffix(query, ";") + " ORDER BY " + orderColumn
-}
-
-// findOrderColumn finds the best column to use for ordering
-func (c *Config) findOrderColumn(query string) string {
-	// Try default order columns in priority order
-	for _, col := range c.Comparison.DefaultOrderColumns {
-		if col == "*" {
-			// Use first column (position 1 in SQL)
-			return "1"
-		}
-
-		// Check if column exists in query (simple heuristic)
-		if strings.Contains(strings.ToLower(query), strings.ToLower(col)) {
-			return col
-		}
-	}
-
-	// Fallback to ordering by first column
-	return "1"
 }

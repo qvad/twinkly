@@ -5,19 +5,17 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"net"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
-	"github.com/qvad/twinkly/pkg/comparator"
 	"github.com/qvad/twinkly/pkg/config"
 )
 
-// DualDatabaseResolver handles connections and query comparison
-type DualDatabaseResolver struct {
+// SideChannelManager handles connections and query comparison
+type SideChannelManager struct {
 	config *config.Config
 	pgAddr string
 	ybAddr string
@@ -31,9 +29,9 @@ type DualDatabaseResolver struct {
 	shutdown chan struct{}
 }
 
-// NewDualDatabaseResolver creates a new resolver with comparison capabilities
-func NewDualDatabaseResolver(config *config.Config, pgAddr, ybAddr string) *DualDatabaseResolver {
-	return &DualDatabaseResolver{
+// NewSideChannelManager creates a new resolver with comparison capabilities
+func NewSideChannelManager(config *config.Config, pgAddr, ybAddr string) *SideChannelManager {
+	return &SideChannelManager{
 		config:   config,
 		pgAddr:   pgAddr,
 		ybAddr:   ybAddr,
@@ -41,38 +39,8 @@ func NewDualDatabaseResolver(config *config.Config, pgAddr, ybAddr string) *Dual
 	}
 }
 
-// GetPGConn implements PGResolver interface
-func (r *DualDatabaseResolver) GetPGConn(ctx context.Context, clientAddr net.Addr, parameters map[string]string) (net.Conn, error) {
-	// Extract IP address for logging
-	var clientIP string
-	if tcpAddr, ok := clientAddr.(*net.TCPAddr); ok {
-		clientIP = tcpAddr.IP.String()
-	} else {
-		clientIP = clientAddr.String()
-	}
-
-	log.Printf("Connection from %s", clientIP)
-
-	// Validate connection parameters
-	if err := ValidateConnectionParameters(parameters); err != nil {
-		log.Printf("SECURITY: Connection rejected from %s: %v", clientAddr, err)
-		return nil, fmt.Errorf("connection validation failed: %w", err)
-	}
-
-	// Route to the configured source of truth backend
-	// The comparison will happen at the query level through our custom handler
-	log.Printf("Routing connection to %s for database: %s", r.config.Comparison.SourceOfTruth, parameters["database"])
-
-	switch r.config.Comparison.SourceOfTruth {
-	case "yugabytedb":
-		return net.Dial("tcp", r.ybAddr)
-	default: // "postgresql"
-		return net.Dial("tcp", r.pgAddr)
-	}
-}
-
 // InitializePools initializes direct database connection pools for comparison
-func (r *DualDatabaseResolver) InitializePools() error {
+func (r *SideChannelManager) InitializePools() error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -135,14 +103,14 @@ func (r *DualDatabaseResolver) InitializePools() error {
 }
 
 // GetPools returns the database connection pools
-func (r *DualDatabaseResolver) GetPools() (*sql.DB, *sql.DB) {
+func (r *SideChannelManager) GetPools() (*sql.DB, *sql.DB) {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 	return r.pgPool, r.ybPool
 }
 
 // startHealthMonitoring starts background health checks for database connections
-func (r *DualDatabaseResolver) startHealthMonitoring() {
+func (r *SideChannelManager) startHealthMonitoring() {
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -160,7 +128,7 @@ func (r *DualDatabaseResolver) startHealthMonitoring() {
 }
 
 // checkConnectionHealth performs health checks on database connections
-func (r *DualDatabaseResolver) checkConnectionHealth() {
+func (r *SideChannelManager) checkConnectionHealth() {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
@@ -184,7 +152,7 @@ func (r *DualDatabaseResolver) checkConnectionHealth() {
 }
 
 // CompareQuery executes a query on both databases and compares results
-func (r *DualDatabaseResolver) CompareQuery(query string) (*QueryComparisonResult, error) {
+func (r *SideChannelManager) CompareQuery(query string) (*QueryComparisonResult, error) {
 	if !r.config.ShouldCompareQuery(query) {
 		return nil, nil // Skip comparison
 	}
@@ -256,7 +224,7 @@ func (r *DualDatabaseResolver) CompareQuery(query string) (*QueryComparisonResul
 }
 
 // executeQuery executes a query on a specific database
-func (r *DualDatabaseResolver) executeQuery(ctx context.Context, db *sql.DB, dbName, query string) (*DatabaseResult, error) {
+func (r *SideChannelManager) executeQuery(ctx context.Context, db *sql.DB, dbName, query string) (*DatabaseResult, error) {
 	start := time.Now()
 
 	rows, err := db.QueryContext(ctx, query)
@@ -329,7 +297,7 @@ func (r *DualDatabaseResolver) executeQuery(ctx context.Context, db *sql.DB, dbN
 }
 
 // logComparison logs the comparison results
-func (r *DualDatabaseResolver) logComparison(result *QueryComparisonResult) {
+func (r *SideChannelManager) logComparison(result *QueryComparisonResult) {
 	if r.config.Comparison.LogDifferencesOnly && result.Match {
 		return // Skip logging matches
 	}
@@ -368,7 +336,7 @@ func (r *DualDatabaseResolver) logComparison(result *QueryComparisonResult) {
 }
 
 // Close cleans up database connections
-func (r *DualDatabaseResolver) Close() error {
+func (r *SideChannelManager) Close() error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -532,81 +500,4 @@ func convertToString(val interface{}) string {
 	default:
 		return fmt.Sprintf("%v", val)
 	}
-}
-
-// ApplyValidationResult applies the result from advanced validation
-// ApplyValidationResult is deprecated - validation moved to dual_proxy.go
-func (r *QueryComparisonResult) ApplyValidationResult(validation *comparator.ValidationResult) {
-	// This functionality has been moved to dual_proxy.go for better integration
-	log.Printf("Warning: ApplyValidationResult is deprecated")
-}
-
-// MirrorDDLToSecondary executes a schema-changing DDL on the secondary database via pools.
-// Secondary is defined as the non-source-of-truth backend.
-func (r *DualDatabaseResolver) MirrorDDLToSecondary(query string) error {
-	if r == nil || r.config == nil {
-		return fmt.Errorf("resolver not initialized")
-	}
-	// Decide which pool is secondary
-	sot := strings.ToLower(r.config.Comparison.SourceOfTruth)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	if sot == "yugabytedb" {
-		if r.pgPool == nil {
-			return fmt.Errorf("PostgreSQL pool not initialized")
-		}
-		if _, err := r.pgPool.ExecContext(ctx, query); err != nil {
-			return fmt.Errorf("failed to mirror DDL to PostgreSQL: %w", err)
-		}
-		log.Printf("✓ Mirrored DDL to PostgreSQL: %s", query)
-		return nil
-	}
-	// Otherwise, source of truth is PostgreSQL; mirror to YugabyteDB
-	if r.ybPool == nil {
-		return fmt.Errorf("YugabyteDB pool not initialized")
-	}
-	if _, err := r.ybPool.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("failed to mirror DDL to YugabyteDB: %w", err)
-	}
-	log.Printf("✓ Mirrored DDL to YugabyteDB: %s", query)
-	return nil
-}
-
-// MirrorDMLToSecondary executes a mutating DML on the secondary database via pools.
-// Secondary is the non-source-of-truth backend. This is best-effort and runs outside
-// any client transaction context; use with care.
-func (r *DualDatabaseResolver) MirrorDMLToSecondary(query string) error {
-	if r == nil || r.config == nil {
-		return fmt.Errorf("resolver not initialized")
-	}
-	sot := strings.ToLower(r.config.Comparison.SourceOfTruth)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	if sot == "yugabytedb" {
-		if r.pgPool == nil {
-			return fmt.Errorf("PostgreSQL pool not initialized")
-		}
-		if _, err := r.pgPool.ExecContext(ctx, query); err != nil {
-			return fmt.Errorf("failed to mirror DML to PostgreSQL: %w", err)
-		}
-		log.Printf("✓ Mirrored DML to PostgreSQL: %s", query)
-		return nil
-	}
-	// Otherwise, source of truth is PostgreSQL; mirror to YugabyteDB
-	if r.ybPool == nil {
-		return fmt.Errorf("YugabyteDB pool not initialized")
-	}
-	if _, err := r.ybPool.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("failed to mirror DML to YugabyteDB: %w", err)
-	}
-	log.Printf("✓ Mirrored DML to YugabyteDB: %s", query)
-	return nil
 }

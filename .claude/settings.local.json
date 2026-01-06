@@ -14,7 +14,20 @@
       "Bash(docker exec:*)",
       "Bash(docker run:*)",
       "Bash(docker build:*)",
-      "Bash(make:*)"
+      "Bash(make:*)",
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(go version:*)",
+      "Bash(go env:*)",
+      "Bash(docker --version:*)",
+      "Bash(wc:*)",
+      "Bash(for func in \"InitializePools\" \"CompareQuery\" \"MirrorDDLToSecondary\" \"MirrorDMLToSecondary\" \"GetPGConn\" \"ValidateQuery\" \"MapError\" \"AddOrderByToQuery\")",
+      "Bash(do echo \"=== $func ===\")",
+      "Bash(done)",
+      "Bash(ls:*)",
+      "Bash(xargs:*)",
+      "Bash(POSTGRES_HOST=localhost YUGABYTE_HOST=localhost go test:*)"
     ],
     "deny": []
   }
